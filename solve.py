@@ -1,5 +1,6 @@
 """Usage: python solve.py [worklist] [solution] [--window N] [--carry] [--alpha A] [--max-detour D] [--max-fill F]
-                   [--future-trip K] [--min-items-per-step N] [--trip-slot above|side]"""
+                   [--future-trip K] [--min-items-per-step N] [--trip-slot above|side]
+                   [--tour greedy|sweep|best] [--rank-tour]"""
 
 import argparse
 import time
@@ -22,13 +23,17 @@ def main() -> None:
                     help="extra must newly cover at least this many items per detour step (0 = off)")
     ap.add_argument("--trip-slot", choices=("above", "side"), default="above",
                     help="where the carried pallet rides on replenishment trips (with --carry)")
+    ap.add_argument("--tour", choices=("greedy", "sweep", "best"), default="best",
+                    help="order tour: greedy nearest-pallet, aisle-aware S-shaped sweep, or the shorter of the two")
+    ap.add_argument("--rank-tour", action="store_true",
+                    help="rank candidate orders by the --tour estimate instead of the greedy one (~5x slower)")
     args = ap.parse_args()
 
     start = time.time()
     m = Manager(args.worklist, window=args.window, carry=args.carry, alpha=args.alpha,
                 max_detour=args.max_detour, max_fill=args.max_fill,
                 future_trip=args.future_trip, min_items_per_step=args.min_items_per_step,
-                trip_slot=args.trip_slot)
+                trip_slot=args.trip_slot, tour_mode=args.tour, rank_tour=args.rank_tour)
     makespan = m.solve()
     m.write_solution(args.solution)
     print(f"makespan {makespan} timesteps, {m.trips} trips, {m.replenishments} replenishments, "

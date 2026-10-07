@@ -75,7 +75,8 @@ Reservation = tuple[int, Coords, int, int | None]
 class Manager:
     def __init__(self, path: str, window: int = 10, carry: bool = False, alpha: float = ALPHA,
                  max_detour: float = MAX_DETOUR, max_fill: float = MAX_FILL, future_trip: float = FUTURE_TRIP,
-                 min_items_per_step: float = MIN_ITEMS_PER_STEP, trip_slot: str = "above"):
+                 min_items_per_step: float = MIN_ITEMS_PER_STEP, trip_slot: str = "above",
+                 tour_mode: str = "best", rank_tour: bool = False):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
@@ -83,6 +84,8 @@ class Manager:
         self.alpha, self.max_detour, self.max_fill = alpha, max_detour, max_fill
         self.future_trip, self.min_items_per_step = future_trip, min_items_per_step
         self.trip_slot = trip_slot
+        self.tour_mode = tour_mode
+        self.rank_tour = rank_tour
         self._load(path)
         self.reservations = ReservationTable(self.entities)
         self.map = StaticMap(self.pallets)
@@ -189,8 +192,9 @@ class Manager:
         carried = self.entities[robot.carry] if robot.carry is not None else None
         if candidates:
             t0 = robot.frontier[-1][1]
-            # shortest estimated path wins
-            task = min(candidates, key=lambda task: self.route(Counter(task[1]), robot.pos, t0, robot=robot)[1])
+            # shortest estimated path wins (rank_tour: the tour that would actually be planned; slower)
+            estimate = self.tour if self.rank_tour else lambda need, pos, t, r: self.route(need, pos, t, robot=r)
+            task = min(candidates, key=lambda task: estimate(Counter(task[1]), robot.pos, t0, robot)[1])
             if carried is not None and task[1].count(carried.sku) > carried.planned_count:
                 return self.replenish_task(robot, None)
             return task
@@ -251,6 +255,94 @@ class Manager:
         if cur is not None:
             travel += self.map.from_top[cur]
         return stops, travel, sum(need.values())
+
+    # ------------------------------------------------------------------ aisle-aware S-shaped sweep
+
+    def tour(self, need: Counter, start: Coords, t0: int, robot: Robot):
+        """The tour actually planned for an order. `tour_mode` greedy: `route` as is. sweep: `route`'s pallets,
+        then swap each SKU to whichever duplicate pallet shortens an S-shaped sweep, visited in sweep order.
+        best: whichever of the two is shorter. Returns (stops, travel estimate, unmet), like `route`."""
+        stops, travel, unmet = self.route(need, start, t0, robot=robot)
+        if self.tour_mode == "greedy" or unmet:
+            return stops, travel, unmet
+        carried = [s for s in stops if s[0].carrier is not None]
+        static = [s for s in stops if s[0].carrier is None]
+        t1 = t0 + sum(q for _, q in carried)
+        qty = {p.id: q for p, q in static}
+        cost = lambda order: self._tour_cost(order, start, t1, qty)
+        # only SKUs served from a single pallet are re-chosen; any pallet of the SKU with enough stock will do
+        count = Counter(p.sku for p, _ in static)
+        pick = {p.sku: p.id for p, _ in static if count[p.sku] == 1}
+        fixed = [p.id for p, _ in static if count[p.sku] > 1]
+        alts = {sku: [q.id for q in self.by_sku[sku] if q.carrier is None and q.planned_count >= qty[pid]]
+                for sku, pid in pick.items()}
+        order = self._sweep(fixed + list(pick.values()), cost)
+        best = cost(order)
+        improved = True
+        while improved:
+            improved = False
+            for sku, options in alts.items():
+                for alt in options:
+                    old = pick[sku]
+                    if alt == old:
+                        continue
+                    pick[sku] = alt
+                    qty[alt] = qty[old]
+                    trial = self._sweep(fixed + list(pick.values()), cost)
+                    c = cost(trial)
+                    if c < best:
+                        best, order, improved = c, trial, True
+                    else:
+                        pick[sku] = old
+        if self.tour_mode == "best" and travel <= best:
+            return stops, travel, unmet
+        return carried + [(self.entities[pid], qty[pid]) for pid in order], best, 0
+
+    def _tour_cost(self, order: list[int], start: Coords | None, t: int, qty: dict[int, int]) -> int:
+        """Travel for visiting `order` (pallet ids) then reaching the fulfilment row, counting waits for pallets
+        still out being replenished, as `route` does."""
+        if not order:
+            return 0
+        m, travel, cur = self.map, 0, None
+        for pid in order:
+            if cur is None:
+                d = m.from_top[pid] if start is None else m.dist_to_pallet(pid, start)
+            else:
+                d = m.between[cur][pid]
+            d = max(d, self.entities[pid].locked_until + 1 - t)
+            travel += d
+            t += d + qty[pid]
+            cur = pid
+        return travel + m.from_top[cur]
+
+    def _sweep(self, pids: list[int], cost) -> list[int]:
+        """S-shaped sweep: each pick face (the column of access cells beside a pallet column) is a lane, walked
+        top-to-bottom or bottom-to-top alternately, so consecutive lanes are joined at the band's end. The upper
+        and lower bands are swept separately; the best of either band first and either horizontal direction wins."""
+        m = self.map
+        bands = ([p for p in pids if self.entities[p].pos[1] < HEIGHT // 2],
+                 [p for p in pids if self.entities[p].pos[1] >= HEIGHT // 2])
+        best, best_cost = None, None
+        for first, second in (bands, bands[::-1]):
+            n = len({m.side[p][0] for p in first})
+            for lr1 in (True, False):
+                for lr2 in (True, False):
+                    order = self._serpentine(first, lr1, True) + self._serpentine(second, lr2, n % 2 == 0)
+                    c = cost(order)
+                    if best_cost is None or c < best_cost:
+                        best, best_cost = order, c
+        return best
+
+    def _serpentine(self, pids: list[int], left_to_right: bool, first_down: bool) -> list[int]:
+        side = self.map.side
+        lanes: dict[int, list[int]] = {}
+        for p in pids:
+            lanes.setdefault(side[p][0], []).append(p)
+        out = []
+        for i, x in enumerate(sorted(lanes, reverse=not left_to_right)):
+            lane = sorted(lanes[x], key=lambda p: self.entities[p].pos[1])
+            out += lane if (i % 2 == 0) == first_down else lane[::-1]
+        return out
 
     def choose_replenishment(self, robot: Robot) -> Pallet | None:
         """Pick the static pallet whose refill (together with the robot's carried one, which every trip refills)
@@ -489,7 +581,7 @@ class Manager:
         return reservations, actions, frontiers, pos, commit
 
     def _plan_order(self, robot: Robot, need: Counter, t0: int):
-        stops, _, unmet = self.route(need, robot.pos, t0, robot=robot)
+        stops, _, unmet = self.tour(need, robot.pos, t0, robot)
         assert unmet == 0
         actions, reservations, frontiers = [], [], []
         foot = self._foot(robot)

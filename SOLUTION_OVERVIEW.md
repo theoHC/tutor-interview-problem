@@ -1,10 +1,11 @@
 # Solution Overview
 
-**Result:** all 1,000 orders fulfilled in **66,743 timesteps**, with 213 pallet replenishments. Checked with `validate.py`.
+**Result:** all 1,000 orders fulfilled in **62,398 timesteps** (`--rank-tour`). Checked with `validate.py`.
 
 ```
-python solve.py [BIG_ORDER.txt] [solution.txt] [--window 10]   # ~16 s
-python validate.py [BIG_ORDER.txt] [solution.txt]               # independent rule check
+python3 solve.py [BIG_ORDER.txt] [solution.txt] --rank-tour   # 62,398, ~4 min
+python3 solve.py [BIG_ORDER.txt] [solution.txt]               # 63,019, ~50 s
+python3 validate.py [BIG_ORDER.txt] [solution.txt]            # independent rule check
 ```
 
 ## Approach
@@ -17,6 +18,35 @@ A basic queue-based allocator with cooperative (space-time) A* path planning:
    - **Replenish:** only when *no* order in the whole queue can be satisfied. Every non-full pallet of a SKU that is short for the head-of-queue orders is a candidate. The candidate chosen is the one whose refill gives the lowest estimated movement cost for those orders. Each item still unavailable after the refill adds a large penalty (1000) to the cost. In effect, the refill that unblocks the most demand wins, and travel time breaks ties.
 3. **Plan it.** Plan each leg of the task with space-time A* against a reservation table that holds every trajectory already committed. The legs are walk to a pallet, then hold there while picking (or docking), and so on. The plan is committed only if every leg is found. Otherwise the robot idles for 10 timesteps and is retried.
 4. Repeat until the queue is empty, then write all actions sorted by `(timestep, robot)`.
+
+### Order tours: greedy vs aisle-aware S-shaped sweep (`--tour`)
+
+The pallets stand in six 2-wide columns, in two bands (y=7–16 and y=23–32). Each pallet is picked from a *face*: the
+column of access cells beside its pallet column (x = 9, 12, 16, 19, …, 47). The sweep treats each face as a lane.
+Within each band, it walks the faces left-to-right or right-to-left, alternating top-to-bottom and bottom-to-top, so
+consecutive lanes join at the band's end. It sweeps one band and then the other, and keeps the best of the 8
+band-order and direction combinations. The sweep also picks *which* duplicate pallet each SKU uses. Starting from the
+greedy tour's pallets, it swaps a SKU to another pallet with enough stock whenever that shortens the sweep, and
+repeats until no swap helps. SKUs split across several pallets keep the greedy allocation.
+
+| `--tour` (order ranking by greedy estimate) | Makespan | Moves |
+|---|---|---|
+| `greedy` (previous behaviour) | 63,841 | 242,149 |
+| `sweep` | 64,829 | 243,809 |
+| `best`: the shorter of greedy and sweep per order (default) | 63,019 | 236,580 |
+| `best` + `--rank-tour` (candidates ranked by that tour too) | **62,398** | 235,183 |
+
+On a static check (full pallets, starting anywhere on row 0, averaged over all 1,000 orders), the sweep with pallet
+choice needs 192 moves per order against the greedy tour's 207. Without the pallet choice it needs 218, so the
+pallet choice is where the sweep's gain comes from. In a live solve, though, the sweep is only about 2% shorter on
+average, and it is longer on 37% of orders. Two things erode it:
+
+- Depleted pallets leave fewer duplicates to swap to.
+- The robot starts at a fixed x, usually where it last fulfilled. A sweep must begin at one end, but nearest-neighbour adapts to the start position.
+
+Taking the shorter tour per order is what pays off. The sweep's local search costs about 20 ms per call, so by default
+it runs only for the order being planned. `--rank-tour` also runs it for each of the `window` candidates, which takes
+about 5× as long.
 
 ### What each task does
 
@@ -69,7 +99,14 @@ On average an order visits about 37 distinct SKUs and takes about 233 moves of t
 
 1. **Carry the high runners.** A robot can dock up to 4 pallets and pick from them with no travel. Demand is Zipf-shaped: SKU 0 alone is 7,824 of 64,506 items (12%), and the top few SKUs appear in almost every order. Each robot could carry 2–3 high-runner pallets for the whole run and refill them by passing along row 39. This removes the most frequent stops from every tour. This needs footprint-aware A*, which `coopastar.plan` already supports through `offsets`.
 2. **Re-slot pallets near the fulfilment row.** Rows 1–6 are entirely empty, and the pallet blocks start at y=7 and y=23. When a pallet is replenished, return it to a slot close to row 0 rather than to its home slot. Over time, move high-runner pallets from the lower band (y=23–32) to the top. Each order tour starts and ends on row 0, so every row closer saves about 2 moves per visit.
-3. **Better tours.** Replace the greedy nearest-pallet tour with 2-opt/or-opt over the static distance tables, or with an aisle-aware S-shaped sweep. Also choose *which* duplicate pallet of a SKU to use jointly with the tour, rather than one stop at a time. Typical gains over nearest-neighbour are 10–20% of travel, which is the 76% bucket.
+3. **Better tours.** The S-shaped sweep is implemented (see above), and the per-order better of sweep and greedy saves
+   about 1,400 timesteps. Next steps:
+   - Run 2-opt/or-opt over the static distance tables on whichever tour wins.
+   - Let the pallet-swap local search also re-choose pallets for the greedy ordering.
+   - Make the sweep start-aware, for example by beginning at the lane nearest the robot.
+
+   Live tours still average about 216 moves. Speeding up `tour` (numba, or caching per order and stock state) would
+   make `--rank-tour` cheap enough to keep on by default.
 4. **Proactive and batched replenishment.** Today a refill only starts when *nothing* is feasible, so robots often stall on depletion and then refill one pallet per trip. Instead:
    - Trigger refills when a pallet falls below a threshold.
    - Dock several depleted pallets in one trip.
