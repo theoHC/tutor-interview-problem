@@ -91,7 +91,8 @@ class Manager:
                  max_shift: float = MAX_SHIFT, fill_weight: float = FILL_WEIGHT, live_map: bool = True,
                  presort: bool = False, pair: bool = True, pair_margin: float = PAIR_MARGIN,
                  barrier: bool = False, rank_by: str = "visits", fill_order: str = "middle",
-                 select: str = "raw", assign: str = "frontier", slack: int = 0, lag_weight: float = 1.0):
+                 select: str = "raw", assign: str = "frontier", slack: int = 0, lag_weight: float = 1.0,
+                 replan: int = 2):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
@@ -107,6 +108,11 @@ class Manager:
         self.barrier = barrier  # no robot starts an order until every presort move has finished
         self.rank_by, self.fill_order = rank_by, fill_order  # target_layout variants
         self.select, self.assign, self.slack, self.lag_weight = select, assign, slack, lag_weight
+        self.replan = replan  # windowed replanning: re-plan the last `replan` order commits in every priority order
+        assert replan == 1 or reslot == "off", "rollback does not undo a changed pallet layout"
+        self.history: list[dict] = []  # trailing ORDER commits that can still be rolled back
+        self.slack_seen = 0
+        self.repairs = 0  # windows whose re-ordered plan was kept
         assert not (presort and carry), "presorting assumes no robot carries a pallet"
         self._load(path)
         self.reservations = ReservationTable(self.entities)
@@ -167,21 +173,27 @@ class Manager:
                 robot, task = self.select_joint(robot)
             else:
                 task = self.select_task(robot)
-            ok = False
-            if task is not None:
-                ok = self.execute(robot, task)
+            entry = self.commit(robot, task) if task is not None else None
+            ok = entry is not None
             if not ok:
+                self.history.clear()
                 # Nothing doable (or no path found): wait in place and let other robots move the world forward.
                 inv, t = robot.frontier[-1]
                 robot.frontier.append((inv, t + IDLE_STEP))
                 continue
+            if task[0] is not TaskType.ORDER:
+                self.history.clear()
             if task[0] is TaskType.ORDER:
+                self.history.append(entry)
+                if self.replan > 1:
+                    del self.history[:-self.replan]
+                    self.repair()
                 self.tasks.remove(task)
                 self.demand.subtract(task[1])
                 self.visits.subtract(set(task[1]))
                 done += 1
                 if verbose and done % 50 == 0:
-                    print(f"  {done} orders planned, frontier t={robot.frontier[-1][1]}, "
+                    print(f"  {done} orders planned, repairs={self.repairs}, frontier t={robot.frontier[-1][1]}, "
                           f"trips={self.trips}, replenishments={self.replenishments}")
         return self.makespan
 
@@ -700,6 +712,85 @@ class Manager:
                 return s
         return home
 
+    # ------------------------------------------------------------------ windowed replanning
+
+    def commit(self, robot: Robot, task: Task) -> dict | None:
+        """`execute`, recording what is needed to roll it back. None if the task could not be planned."""
+        snap = {
+            "robot": robot, "pos": robot.pos, "na": len(robot.actions), "nf": len(robot.frontier),
+            "pallets": [(p.planned_count, p.last_pick, p.locked_until) for p in self.pallets], "task": task,
+        }
+        self.reservations.journal = snap["journal"] = []
+        try:
+            ok = self.execute(robot, task)
+        finally:
+            self.reservations.journal = None
+        if not ok:
+            return None
+        snap["slack"] = self.slack_seen
+        return snap
+
+    def rollback(self, entries: list[dict]) -> None:
+        for e in reversed(entries):
+            self.reservations.rollback(e["journal"])
+            r = e["robot"]
+            r.pos = e["pos"]
+            del r.actions[e["na"]:]
+            del r.frontier[e["nf"]:]
+        for p, (pc, lp, lu) in zip(self.pallets, entries[0]["pallets"]):
+            p.planned_count, p.last_pick, p.locked_until = pc, lp, lu
+
+    def _replay(self, entries: list[dict]) -> list[dict] | None:
+        """Re-plan `entries`' tasks in the given order from the current state. On failure undoes itself, returns None."""
+        done = []
+        for e in entries:
+            new = self.commit(e["robot"], e["task"])
+            if new is None:
+                if done:
+                    self.rollback(done)
+                return None
+            done.append(new)
+        return done
+
+    @staticmethod
+    def _interleavings(entries: list[dict]):
+        """Every ordering of `entries` that keeps each robot's own tasks in order."""
+        if not entries:
+            yield []
+            return
+        seen = set()
+        for i, e in enumerate(entries):
+            if e["robot"].id in seen:
+                continue
+            seen.add(e["robot"].id)
+            for rest in Manager._interleavings(entries[:i] + entries[i + 1:]):
+                yield [e] + rest
+
+    def repair(self) -> None:
+        """Windowed replanning. The trailing ORDER commits (at most `replan`) were planned one after another, each
+        dodging the earlier ones; try every other priority order for them and keep the one that leaves the robots
+        involved finishing earliest in total. Skipped when none of the window's plans had to wait or detour."""
+        window = self.history
+        if len(window) < 2 or not any(e["slack"] for e in window):
+            return
+        robots = {e["robot"].id: e["robot"] for e in window}
+        score = lambda: sum(r.frontier[-1][1] for r in robots.values())
+        best_score, best = score(), None
+        self.rollback(window)
+        for order in self._interleavings(window):
+            if all(a is b for a, b in zip(order, window)):
+                continue
+            done = self._replay(order)
+            if done is None:
+                continue
+            if score() < best_score:
+                best_score, best = score(), order
+            self.rollback(done)
+        redo = self._replay(best or window)
+        assert redo is not None
+        self.history[:] = redo
+        self.repairs += best is not None
+
     # ------------------------------------------------------------------ planning
 
     def execute(self, robot: Robot, task: Task) -> bool:
@@ -707,6 +798,7 @@ class Manager:
         rt = self.reservations
         inv, t0 = robot.frontier[-1]
         foot = self._foot(robot)
+        self.slack_seen = 0
         for _, off in foot:
             rt.unpark(*add(robot.pos, off), t0)
         if task[0] is TaskType.ORDER:
@@ -752,6 +844,7 @@ class Manager:
         group = tuple(e for e, _ in foot)
         offsets = tuple(o for _, o in foot)
         path = plan(self.reservations, pos, t, group, offsets, goal, hold, lambda c: h.item(c))
+        self.slack_seen += len(path) - 1 - h.item(pos)  # steps beyond the obstacle-free distance
         return path, t + len(path) - 1
 
     @staticmethod
@@ -832,7 +925,8 @@ class Manager:
 
     def _plan_order(self, robot: Robot, need: Counter, t0: int):
         stops, _, unmet = self.tour(need, robot.pos, t0, robot)
-        assert unmet == 0
+        if unmet:  # only possible when replanning has reordered orders so that stock no longer covers this one
+            raise NoPath("order no longer coverable")
         actions, reservations, frontiers = [], [], []
         foot = self._foot(robot)
         pos, t, inv = robot.pos, t0, []

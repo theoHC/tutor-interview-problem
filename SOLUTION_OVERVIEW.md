@@ -1,9 +1,9 @@
 # Solution Overview
 
-**Result:** all 1,000 orders fulfilled in **58,940 timesteps** (defaults: presort with 2-pallet trips, window 20). Checked with `validate.py`.
+**Result:** all 1,000 orders fulfilled in **58,835 timesteps** (defaults: presort with 2-pallet trips, window 20, replan window 2). Checked with `validate.py`.
 
 ```
-python3 solve.py [BIG_ORDER.txt] [solution.txt]               # 58,940, ~50 s
+python3 solve.py [BIG_ORDER.txt] [solution.txt]               # 58,835, ~135 s (--replan 1 = previous 58,940, ~50 s)
 python3 validate.py [BIG_ORDER.txt] [solution.txt]            # independent rule check
 python3 solve.py ... --no-presort --window 10 --rank-tour     # previous best without presort: 62,398, ~4 min
 python3 solve.py ... --no-presort --window 10 --reslot packed # re-slot pallets on refill instead (64,275; see below)
@@ -155,6 +155,27 @@ Two variants of recommendation 5 were tried. Neither beat the default (58,940), 
 
 Marginal and per-item ranking lose about 1,000–1,200. Central assignment is at best level with the default (slack 10: +2, within noise), and a wider slack is worse. Robots already finish within about 300 timesteps of each other, so there is little imbalance for joint assignment to fix. Letting a later-frontier robot plan first also fits worse into the prioritised reservation table.
 
+### Windowed replanning (`--replan N`, default 2)
+
+Prioritised planning never revises a commit, so the plan committed second has to dodge the first even when swapping
+would be cheaper. After each ORDER commit, if any plan in the trailing window (up to N order commits, cut at any
+replenishment or idle step) waited or detoured, the window is rolled back and re-planned in every other priority order
+that keeps each robot's own tasks in sequence. The order that leaves the involved robots with the smallest summed finish
+time is kept. Rollback uses a write journal on the `ReservationTable` plus a snapshot of robot and pallet stock state;
+it is disabled with `--reslot` (a changed layout can't be undone). This is a priority search standing in for
+conflict-based search: with a prioritised planner conflicts can't occur, so the search is over priorities, not constraints.
+
+| Variant | Makespan | Time |
+|---|---|---|
+| `--replan 1` (off) | 58,940 | 50 s |
+| `--replan 2` (**default**) | **58,835** | 133 s |
+| `--replan 3` | 59,506 | 394 s |
+| `--replan 4` | not finished (killed after ~25 min) | |
+
+Only about 2.2% of robot-timesteps (6,400 steps over 39,000 A* legs) are spent beyond the obstacle-free distance, so
+the ceiling is about 1,300 timesteps. The gain here (105) is within the noise of the greedy allocator. Larger windows
+were worse: a lower summed finish time doesn't mean a better downstream state.
+
 ### What each task does
 
 - **Order:** visit pallets in greedy nearest-first order and pick the required quantity at each. Then go to the fulfilment row, fulfil, and park there.
@@ -193,18 +214,18 @@ These are chosen to be safe under any reading of the rules. Each costs some time
 
 ## Where the time goes
 
-Measured on the current best `solution.txt` (58,940, defaults):
+Measured on the current best `solution.txt` (58,835, defaults):
 
-| Robot-timesteps (5 robots × 58,940 = 295k) | Count | Share |
+| Robot-timesteps (5 robots × 58,835 = 294k) | Count | Share |
 |---|---|---|
-| Moves | 218,930 | 74.3% |
+| Moves | 218,949 | 74.4% |
 | … of which presort moves (before t=1,765) | 8,220 | 2.8% |
 | Picks (fixed by the problem) | 64,506 | 21.9% |
 | Fulfil, dock, undock (233 presort docks and undocks included) | 1,936 | 0.7% |
-| No action (waiting, including the tail after a robot's last task) | 9,328 | 3.2% |
-| Dragging docked pallets, dock → undock (overlaps with moves) | 16,797 | 5.7% |
+| No action (waiting, including the tail after a robot's last task) | 8,784 | 3.0% |
+| Dragging docked pallets, dock → undock (overlaps with moves) | not re-measured (was 16,797 at 58,940) | |
 
-Robots finish between t=58,637 and t=58,939. The presort occupies about 8,800 robot-timesteps (5 × 1,765) and
+Robots finish between t=58,490 and t=58,834. The presort occupies about 8,800 robot-timesteps (5 × 1,765) and
 saves about 23,000 order and replenishment moves (window 10: 236,580 without presort vs 213,401 after it).
 
 On average an order visits about 37 distinct SKUs and takes about 211 moves of travel against about 65 picks. Robots finish within about 300 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742 (measured before the row-39 wait was removed). Dropping the 213 one-step waits changed the makespan by +147. The greedy allocator is sensitive to small timing shifts, so differences of a few hundred timesteps are noise rather than signal.
@@ -233,4 +254,4 @@ On average an order visits about 37 distinct SKUs and takes about 211 moves of t
    - Fold a refill into an order tour when the robot passes near row 39.
 5. **Smarter order selection.** Tried and did not help (see *Order ranking and central robot assignment*): marginal and per-item ranking are 1,000+ worse, and joint robot-order assignment ties the default at best. A different angle would be looking ahead (choosing orders that leave stock and positions good for the next ones).
 6. **Relax the no-following rule once confirmed.** Allow follow-the-leader moves if the testbench accepts them. This is a small win: tens to hundreds of timesteps.
-7. **Planner robustness and speed.** Prioritised planning never revises a committed plan. Windowed replanning or conflict-based search would recover the waits that come from planning order. The Python A* is fast enough now (about 16 s per solve), but ideas 1–3 add search. Porting the inner loop to numba, or caching heuristics, will keep iteration quick.
+7. **Planner robustness and speed.** Windowed replanning is implemented (see above): a small, noisy gain (−105) against a ceiling of about 1,300. A true conflict-based search over constraints is not tried. The Python A* is fast enough now (about 16 s per solve), but ideas 1–3 add search. Porting the inner loop to numba, or caching heuristics, will keep iteration quick.

@@ -30,4 +30,6 @@ HAHA WE'RE SUB-60K (58940)!!!!!! Nice. Just moving everything up towards the top
 
 Now, let's see if there's any juice in smarter allocation of tasks (e.g. sort them by marginal extra movement needed) and in assigning tasks centrally.
 
-...aaaaaand nope. I bet for a smaller number of larger tasks, centralized assignment would help, but since each robot does a large number of small tasks, my naive approach turns out to be the best. Let's try some Claude-suggested changes to the planner (windowed and conflict based replanning)
+...aaaaaand nope. I bet for a smaller number of larger tasks, centralized assignment would help, but since each robot does a large number of small tasks, my basically greedy assignment for just forcing bots to do as much as possible as soon as possible turns out to be the play.
+
+Some window-based replanning shaved a handfull of steps off; I remain convinced that a more thorough ground-up rethink of planning is needed to get much further. 

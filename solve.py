@@ -50,6 +50,8 @@ def main() -> None:
                     help="frontier: earliest robot picks its order; central: pick the best (robot, order) pair")
     ap.add_argument("--slack", type=int, default=0, help="central: robots this many steps past the earliest compete")
     ap.add_argument("--lag-weight", type=float, default=1.0, help="central: score penalty per step of robot lag")
+    ap.add_argument("--replan", type=int, default=2,
+                    help="windowed replanning: re-plan the last N order commits in every priority order (1 = off)")
     args = ap.parse_args()
 
     start = time.time()
@@ -60,11 +62,13 @@ def main() -> None:
                 reslot=args.reslot, max_shift=args.max_shift, fill_weight=args.fill_weight,
                 presort=not args.no_presort, pair=not args.no_pair, pair_margin=args.pair_margin,
                 barrier=args.barrier, select=args.select, assign=args.assign, slack=args.slack,
-                lag_weight=args.lag_weight)
+                lag_weight=args.lag_weight, replan=args.replan)
     makespan = m.solve()
     m.write_solution(args.solution)
     if m.presort:
         print(f"presort: {m.relocations} pallets moved in {m.relocation_trips} trips, done by t={m.presort_end}")
+    if args.replan > 1:
+        print(f"windowed replanning kept {m.repairs} re-ordered windows")
     print(f"makespan {makespan} timesteps, {m.trips} trips, {m.replenishments} replenishments ({m.moved} re-slotted), "
           f"wrote {args.solution} in {time.time() - start:.1f}s")
 

@@ -37,6 +37,8 @@ class ReservationTable:
             x, y = e.pos
             self.permanent[x, y] = e.id
         self.table = np.repeat(self.permanent[:, :, None], CHUNK, axis=2)
+        # when a list, every write below appends what it overwrote, so `rollback` can undo a batch of writes
+        self.journal: list | None = None
 
     @property
     def horizon(self) -> int:
@@ -70,19 +72,32 @@ class ReservationTable:
     def reserve(self, x: int, y: int, t0: int, t1: int, eid: int) -> None:
         """Mark (x, y) as owned by eid for every t in [t0, t1]."""
         self.extend(t1)
+        if self.journal is not None:
+            self.journal.append((x, y, t0, self.table[x, y, t0 : t1 + 1].copy(), None))
         self.table[x, y, t0 : t1 + 1] = eid
 
     def park(self, x: int, y: int, t: int, eid: int) -> None:
         """eid occupies (x, y) from timestep t onwards, indefinitely (until `unpark`)."""
         self.extend(t)
+        if self.journal is not None:
+            self.journal.append((x, y, t, self.table[x, y, t:].copy(), self.permanent.item(x, y)))
         self.table[x, y, t:] = eid
         self.permanent[x, y] = eid
 
     def unpark(self, x: int, y: int, t: int) -> None:
         """Release an indefinite occupation of (x, y) from timestep t onwards."""
         self.extend(t)
+        if self.journal is not None:
+            self.journal.append((x, y, t, self.table[x, y, t:].copy(), self.permanent.item(x, y)))
         self.table[x, y, t:] = EMPTY
         self.permanent[x, y] = EMPTY
+
+    def rollback(self, journal: list) -> None:
+        """Undo the writes recorded in `journal`, newest first."""
+        for x, y, t, old, perm in reversed(journal):
+            self.table[x, y, t : t + len(old)] = old
+            if perm is not None:
+                self.permanent[x, y] = perm
 
 
 def bfs(blocked: np.ndarray, sources: list[Coords]) -> np.ndarray:
