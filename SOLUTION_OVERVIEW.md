@@ -1,6 +1,6 @@
 # Solution Overview
 
-**Result:** all 1,000 orders fulfilled in **66,596 timesteps**, with 213 pallet replenishments. Checked with `validate.py`.
+**Result:** all 1,000 orders fulfilled in **66,743 timesteps**, with 213 pallet replenishments. Checked with `validate.py`.
 
 ```
 python solve.py [BIG_ORDER.txt] [solution.txt] [--window 10]   # ~16 s
@@ -24,7 +24,7 @@ A basic queue-based allocator with cooperative (space-time) A* path planning:
 - **Replenish:**
   1. Wait at the parking spot until just before the last pick already reserved on the pallet.
   2. Walk to a side access cell and dock.
-  3. Drag the pallet to row 39 and wait one timestep there.
+  3. Drag the pallet to row 39. The refill fires at the end of the arrival timestep, so the robot turns straight round.
   4. Drag it back to its home slot and undock.
   5. Park in an open cell away from any pallet, so the robot never blocks an access cell.
 
@@ -51,20 +51,19 @@ A basic queue-based allocator with cooperative (space-time) A* path planning:
 These are chosen to be safe under any reading of the rules. Each costs some time if the real simulator is more lenient.
 
 - **No following:** a robot never enters a cell another entity is leaving in the same timestep, in either direction. We don't depend on the order the simulator resolves moves in.
-- **Extra wait on row 39:** replenishing robots spend one extra timestep on row 39 in case the refill doesn't fire on the arrival step. Cost: 213 timesteps of robot time in total.
 - **Action coordinates:** `fulfill` is written with the robot's own coordinates. `pick`, `dock` and `undock` use the pallet's coordinates.
 - **Dock side:** robots never dock from directly north of a pallet. A docked pallet keeps its offset, so a pallet hanging below the robot would stop the robot from ever reaching row 39.
 
 ## Where the time goes
 
-| Robot-timesteps (5 robots × 66,596 = 333k) | Count | Share |
+| Robot-timesteps (5 robots × 66,743 = 334k) | Count | Share |
 |---|---|---|
-| Moves | 251,821 | 76% |
+| Moves | 252,274 | 76% |
 | Picks (fixed by the problem) | 64,506 | 19% |
-| Replenishment trips (whole task) | 30,573 | 9% (overlaps with moves) |
+| Replenishment trips (whole task) | 30,528 | 9% (overlaps with moves) |
 | Waiting inside tasks | ~14,400 | 4% |
 
-On average an order visits about 37 distinct SKUs and takes about 233 moves of travel against about 65 picks. Robots finish within about 340 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742.
+On average an order visits about 37 distinct SKUs and takes about 233 moves of travel against about 65 picks. Robots finish within about 345 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742 (measured before the row-39 wait was removed). Dropping the 213 one-step waits changed the makespan by +147. The greedy allocator is sensitive to small timing shifts, so differences of a few hundred timesteps are noise rather than signal.
 
 ## Recommendations (ordered by expected impact)
 
@@ -77,5 +76,5 @@ On average an order visits about 37 distinct SKUs and takes about 233 moves of t
    - Include the replenisher's own travel in the pallet score.
    - Fold a refill into an order tour when the robot passes near row 39.
 5. **Smarter order selection.** Score orders by travel *per item* or by marginal travel given the current position, rather than raw path length. The raw measure favours small orders now and leaves expensive ones for the end. Selecting orders for all robots jointly would also beat the earliest-frontier greedy.
-6. **Relax the conservative rules once confirmed.** Allow follow-the-leader moves and drop the extra wait on row 39 if the testbench accepts them. These are small wins: tens to hundreds of timesteps.
+6. **Relax the no-following rule once confirmed.** Allow follow-the-leader moves if the testbench accepts them. This is a small win: tens to hundreds of timesteps.
 7. **Planner robustness and speed.** Prioritised planning never revises a committed plan. Windowed replanning or conflict-based search would recover the waits that come from planning order. The Python A* is fast enough now (about 16 s per solve), but ideas 1–3 add search. Porting the inner loop to numba, or caching heuristics, will keep iteration quick.

@@ -295,15 +295,13 @@ class Manager:
         off = (home[0] - dock_cell[0], home[1] - dock_cell[1])
         both = [(rid, (0, 0)), (pid, off)]
 
-        # 2. drag it to the replenishment row and sit there for one extra timestep so the refill certainly fires
+        # 2. drag it to the replenishment row. The refill fires at the end of the timestep in which the robot moves
+        #    onto row 39, so it can turn straight round on the next timestep.
         t = td + 1
-        path, ta = self._walk(rid, dock_cell, t, lambda c: c[1] == REPLENISH_ROW, lambda ta: ta + 1,
+        path, ta = self._walk(rid, dock_cell, t, lambda c: c[1] == REPLENISH_ROW, lambda ta: ta,
                               self.map.to_replenish, (rid, pid), ((0, 0), off))
         self._moves(path, t, actions, reservations, both)
-        t = ta + 1
-        cell = path[-1]
-        for eid, (dx, dy) in both:
-            reservations.append((eid, (cell[0] + dx, cell[1] + dy), ta, t))
+        t, cell = ta, path[-1]
 
         # 3. bring it back to its home slot and undock
         path, ta = self._walk(rid, cell, t, lambda c: c == dock_cell, lambda ta: ta + 1,
