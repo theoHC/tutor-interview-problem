@@ -32,9 +32,11 @@ Frontier = tuple[tuple[int, ...], int]
 class Pallet:
     sku: int
     pos: Coords
-    count: int
+    planned_count: int # this is the anticipated count AFTER all currently reserved picks happen
     max_count: int
     id: int = field(default_factory=new_id)
+    locked_until: int = -1 # when being carried like for restocking, this is set to the planned undocking timestep.
+    last_pick: int = -1 # latest timestep at which any robot has a pick reserved from this pallet
 
 
 @dataclass

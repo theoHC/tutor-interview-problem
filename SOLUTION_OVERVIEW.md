@@ -1,0 +1,81 @@
+# Solution Overview
+
+**Result:** all 1,000 orders fulfilled in **66,596 timesteps**, with 213 pallet replenishments. Checked with `validate.py`.
+
+```
+python solve.py [BIG_ORDER.txt] [solution.txt] [--window 10]   # ~16 s
+python validate.py [BIG_ORDER.txt] [solution.txt]               # independent rule check
+```
+
+## Approach
+
+A basic queue-based allocator with cooperative (space-time) A* path planning:
+
+1. **Pick the robot.** Choose the robot whose *frontier* (the timestep its last planned task ends) is smallest.
+2. **Pick the task.**
+   - **Order:** scan the order queue for the first `window` (10) orders that the stock on the map can fully satisfy. Assign the one with the shortest estimated path from this robot. The estimate is a greedy nearest-pallet tour that ends on the fulfilment row.
+   - **Replenish:** only when *no* order in the whole queue can be satisfied. Every non-full pallet of a SKU that is short for the head-of-queue orders is a candidate. The candidate chosen is the one whose refill gives the lowest estimated movement cost for those orders. Each item still unavailable after the refill adds a large penalty (1000) to the cost. In effect, the refill that unblocks the most demand wins, and travel time breaks ties.
+3. **Plan it.** Plan each leg of the task with space-time A* against a reservation table that holds every trajectory already committed. The legs are walk to a pallet, then hold there while picking (or docking), and so on. The plan is committed only if every leg is found. Otherwise the robot idles for 10 timesteps and is retried.
+4. Repeat until the queue is empty, then write all actions sorted by `(timestep, robot)`.
+
+### What each task does
+
+- **Order:** visit pallets in greedy nearest-first order and pick the required quantity at each. Then go to the fulfilment row, fulfil, and park there.
+- **Replenish:**
+  1. Wait at the parking spot until just before the last pick already reserved on the pallet.
+  2. Walk to a side access cell and dock.
+  3. Drag the pallet to row 39 and wait one timestep there.
+  4. Drag it back to its home slot and undock.
+  5. Park in an open cell away from any pallet, so the robot never blocks an access cell.
+
+### Stock bookkeeping (no over-picking)
+
+- `Pallet.planned_count` is the stock left after every pick reserved so far. A plan deducts its picks when it commits.
+- Replenishment docks only after the pallet's `last_pick`. While the pallet is out, `locked_until` blocks new picks from it.
+- When replenishment is planned, `planned_count` resets to `max_count`, because every later pick happens after the refill.
+- Stock from in-flight refills counts when deciding whether an order is feasible. A robot may therefore wait beside a pallet until it returns full, instead of starting another refill.
+
+## Code map
+
+| File | Role |
+|---|---|
+| [objects.py](objects.py) | `Robot` and `Pallet` dataclasses (`planned_count`, `locked_until`, `last_pick`) and frontier types |
+| [navigation.py](navigation.py) | `ReservationTable` (`[x, y, t]` occupancy, plus a permanent layer for resting pallets and parked robots) and `StaticMap` (BFS distance tables used for A* heuristics and route estimates) |
+| [coopastar.py](coopastar.py) | Space-time A*. It supports a multi-cell footprint (robot plus docked pallet) and "arrive, then hold for N steps" goals |
+| [manager.py](manager.py) | Queue allocation, route and replenishment heuristics, task planning, solution writer |
+| [solve.py](solve.py) | Entry point |
+| [validate.py](validate.py) | Simulator of the README rules. Stricter than required where the README is ambiguous |
+
+## Assumptions to confirm on the testbench
+
+These are chosen to be safe under any reading of the rules. Each costs some time if the real simulator is more lenient.
+
+- **No following:** a robot never enters a cell another entity is leaving in the same timestep, in either direction. We don't depend on the order the simulator resolves moves in.
+- **Extra wait on row 39:** replenishing robots spend one extra timestep on row 39 in case the refill doesn't fire on the arrival step. Cost: 213 timesteps of robot time in total.
+- **Action coordinates:** `fulfill` is written with the robot's own coordinates. `pick`, `dock` and `undock` use the pallet's coordinates.
+- **Dock side:** robots never dock from directly north of a pallet. A docked pallet keeps its offset, so a pallet hanging below the robot would stop the robot from ever reaching row 39.
+
+## Where the time goes
+
+| Robot-timesteps (5 robots × 66,596 = 333k) | Count | Share |
+|---|---|---|
+| Moves | 251,821 | 76% |
+| Picks (fixed by the problem) | 64,506 | 19% |
+| Replenishment trips (whole task) | 30,573 | 9% (overlaps with moves) |
+| Waiting inside tasks | ~14,400 | 4% |
+
+On average an order visits about 37 distinct SKUs and takes about 233 moves of travel against about 65 picks. Robots finish within about 340 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742.
+
+## Recommendations (ordered by expected impact)
+
+1. **Carry the high runners.** A robot can dock up to 4 pallets and pick from them with no travel. Demand is Zipf-shaped: SKU 0 alone is 7,824 of 64,506 items (12%), and the top few SKUs appear in almost every order. Each robot could carry 2–3 high-runner pallets for the whole run and refill them by passing along row 39. This removes the most frequent stops from every tour. This needs footprint-aware A*, which `coopastar.plan` already supports through `offsets`.
+2. **Re-slot pallets near the fulfilment row.** Rows 1–6 are entirely empty, and the pallet blocks start at y=7 and y=23. When a pallet is replenished, return it to a slot close to row 0 rather than to its home slot. Over time, move high-runner pallets from the lower band (y=23–32) to the top. Each order tour starts and ends on row 0, so every row closer saves about 2 moves per visit.
+3. **Better tours.** Replace the greedy nearest-pallet tour with 2-opt/or-opt over the static distance tables, or with an aisle-aware S-shaped sweep. Also choose *which* duplicate pallet of a SKU to use jointly with the tour, rather than one stop at a time. Typical gains over nearest-neighbour are 10–20% of travel, which is the 76% bucket.
+4. **Proactive and batched replenishment.** Today a refill only starts when *nothing* is feasible, so robots often stall on depletion and then refill one pallet per trip. Instead:
+   - Trigger refills when a pallet falls below a threshold.
+   - Dock several depleted pallets in one trip.
+   - Include the replenisher's own travel in the pallet score.
+   - Fold a refill into an order tour when the robot passes near row 39.
+5. **Smarter order selection.** Score orders by travel *per item* or by marginal travel given the current position, rather than raw path length. The raw measure favours small orders now and leaves expensive ones for the end. Selecting orders for all robots jointly would also beat the earliest-frontier greedy.
+6. **Relax the conservative rules once confirmed.** Allow follow-the-leader moves and drop the extra wait on row 39 if the testbench accepts them. These are small wins: tens to hundreds of timesteps.
+7. **Planner robustness and speed.** Prioritised planning never revises a committed plan. Windowed replanning or conflict-based search would recover the waits that come from planning order. The Python A* is fast enough now (about 16 s per solve), but ideas 1–3 add search. Porting the inner loop to numba, or caching heuristics, will keep iteration quick.
