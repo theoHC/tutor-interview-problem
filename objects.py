@@ -37,12 +37,13 @@ class Pallet:
     id: int = field(default_factory=new_id)
     locked_until: int = -1 # when being carried like for restocking, this is set to the planned undocking timestep.
     last_pick: int = -1 # latest timestep at which any robot has a pick reserved from this pallet
+    carrier: int | None = None # id of the robot permanently carrying this pallet; `pos` is then stale (its old home)
 
 
 @dataclass
 class Robot:
     pos: Coords
-    carried: list[int] = field(default_factory=list)
+    carry: int | None = None # id of the pallet this robot carries for the whole run (docked below it between tasks)
     id: int = field(default_factory=new_id)
     actions: list[PlannedAction] = field(default_factory=list)
     frontier: list[Frontier] = field(default_factory=lambda: [((), 0)])

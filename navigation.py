@@ -129,6 +129,17 @@ class StaticMap:
                 lo_x, hi_x, lo_y, hi_y = max(0, x - 3), x + 4, max(0, y - 3), y + 4
                 self.parking[x, y] = not self.blocked[lo_x:hi_x, lo_y:hi_y].any()
         self.to_parking = bfs(self.blocked, list(zip(*np.nonzero(self.parking))))
+        # side access: pallets stand in 2-wide column pairs, so each has exactly one access cell level with it.
+        # Docking from there puts the pallet on the robot's west or east side.
+        self.side = {p.id: next(c for c in self.access[p.id] if c[1] == p.pos[1]) for p in pallets}
+        self.side_off = {p.id: (p.pos[0] - self.side[p.id][0], 0) for p in pallets}
+        self.to_bottom = {a: min(int(self.to_replenish[c]) for c in self.access[a]) for a in ids}
+        # cells whose whole 3x3 neighbourhood is open, away from the parked rows at the edges: a robot can undock a
+        # pallet here and walk round it to re-dock from another side
+        self.open3 = np.zeros((WIDTH, HEIGHT), dtype=bool)
+        for x in range(1, WIDTH - 1):
+            for y in range(3, HEIGHT - 2):
+                self.open3[x, y] = not self.blocked[x - 1 : x + 2, y - 1 : y + 2].any()
 
     def dist_to_pallet(self, pid: int, c: Coords) -> int:
         return int(self.to_pallet[pid][c])
