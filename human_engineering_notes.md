@@ -25,3 +25,5 @@ Oh god, naive re-organizing of the pallets doesn't seem to help either. OK, this
 Yeah the constant thread on these is that the cost of the optimization kills the gains - turns out that the fully re-organized warehouse is like 10% better than the default layout, but the partially reorganized warehouse is actually worse. Goddamn does this suck. Local attacks on a global problem just be like this.
 
 Hmmm... potentially, starting sorting could save me about 2000 moves. Let's give it a shot.
+
+HAHA WE'RE SUB-60K!!!!!! Nice. Just moving everything up towards the top and sorting by pick frequency really helped. It's not quite as much as I'd hoped, but the net result is that principled optimizations saved me about 10% from my start.

@@ -22,6 +22,8 @@ from collections import Counter, deque
 from enum import Enum, auto
 from itertools import permutations
 
+from scipy.optimize import linear_sum_assignment
+
 from coopastar import NoPath, plan
 from navigation import FULFILL_ROW, HEIGHT, REPLENISH_ROW, SLOT_ROWS, ReservationTable, StaticMap, bfs
 from objects import Action, Coords, Pallet, Robot
@@ -45,6 +47,9 @@ FUTURE_TRIP = 1.0  # extra's detour must be <= this * (the dedicated trip it sav
 MIN_ITEMS_PER_STEP = 1.0  # extra must newly cover at least this many items of demand per step of detour
 END_WEIGHT = 0.5  # how much the trip's end position (distance back to the fulfilment row) counts in its length
 
+# Presort phase (see `relocate_all`)
+PAIR_MARGIN = 0  # a 2-pallet trip must be estimated at least this many steps shorter than doing the moves one by one
+
 # Re-slotting a replenished pallet (see `choose_slot`)
 MAX_SHIFT = 7  # columns of horizontal shift accepted without the detour-vs-savings test (7 = one column pair)
 FILL_WEIGHT = 1.0  # steps saved per order served, per step a slot is closer to the fulfilment row
@@ -65,10 +70,12 @@ class TaskType(Enum):
     ORDER = auto()
     REPLENISH = auto()
     CARRY = auto()
+    RELOCATE = auto()
 
 
-# (ORDER, tuple of SKUs), (CARRY, pallet) or
-# (REPLENISH, (pallets to dock in order, fallback if that can't be planned, carried pallet's offset on the trip))
+# (ORDER, tuple of SKUs), (CARRY, pallet),
+# (REPLENISH, (pallets to dock in order, fallback if that can't be planned, carried pallet's offset on the trip)) or
+# (RELOCATE, options to try in turn, each (pallets to dock in order, (pallet, new slot) to undock in order))
 Task = tuple[TaskType, object]
 
 # A tentative plan is committed only once every stage of it has been found:
@@ -81,7 +88,9 @@ class Manager:
                  max_detour: float = MAX_DETOUR, max_fill: float = MAX_FILL, future_trip: float = FUTURE_TRIP,
                  min_items_per_step: float = MIN_ITEMS_PER_STEP, trip_slot: str = "above",
                  tour_mode: str = "best", rank_tour: bool = False, reslot: str = "off",
-                 max_shift: float = MAX_SHIFT, fill_weight: float = FILL_WEIGHT, live_map: bool = True):
+                 max_shift: float = MAX_SHIFT, fill_weight: float = FILL_WEIGHT, live_map: bool = True,
+                 presort: bool = False, pair: bool = True, pair_margin: float = PAIR_MARGIN,
+                 barrier: bool = False, rank_by: str = "visits", fill_order: str = "middle"):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
@@ -93,9 +102,13 @@ class Manager:
         self.rank_tour = rank_tour
         self.reslot, self.max_shift, self.fill_weight = reslot, max_shift, fill_weight
         self.live_map = live_map  # recompute distance tables whenever a pallet changes slot (else: starting layout)
+        self.presort, self.pair, self.pair_margin = presort, pair, pair_margin
+        self.barrier = barrier  # no robot starts an order until every presort move has finished
+        self.rank_by, self.fill_order = rank_by, fill_order  # target_layout variants
+        assert not (presort and carry), "presorting assumes no robot carries a pallet"
         self._load(path)
         self.reservations = ReservationTable(self.entities)
-        self.map = StaticMap(self.pallets, reslot=reslot != "off")
+        self.map = StaticMap(self.pallets, reslot=reslot != "off" or presort)
         self.by_sku: dict[int, list[Pallet]] = {}
         for p in self.pallets:
             self.by_sku.setdefault(p.sku, []).append(p)
@@ -107,6 +120,9 @@ class Manager:
         self.trips = 0
         self.replenishments = 0  # pallets refilled (the carried one included)
         self.moved = 0  # refills that put the pallet in a different slot from the one it came from
+        self.relocations = 0  # pallets moved during the presort phase
+        self.relocation_trips = 0
+        self.presort_end = 0  # timestep by which every robot has finished the presort phase
 
     def _load(self, path: str) -> None:
         with open(path) as f:
@@ -140,6 +156,8 @@ class Manager:
         robots = self.robots
         if self.carry:
             self.assign_carries()
+        if self.presort:
+            self.relocate_all(verbose)
         done = 0
         while self.tasks:
             robot = min(robots, key=lambda r: r.frontier[-1][1])
@@ -485,6 +503,116 @@ class Manager:
             stock[q.sku] += q.max_count - q.planned_count  # a second pallet of this SKU only scores what's still short
         return seq, total
 
+    # ------------------------------------------------------------------ presort: move every pallet to its slot first
+
+    def target_layout(self) -> dict[int, Coords]:
+        """The `packed` layout: SKUs ranked by how many orders use them, their pallets filling the slot rows top
+        down, middle columns of a row first. A pallet keeps its side of a column pair (it is docked from the aisle
+        and keeps that offset). Cells robots start on are left empty. Within each row the pallets bound for it are
+        then matched to its slots so as few as possible move, and those that move travel as little as possible."""
+        m = self.map
+        if self.rank_by == "visits":
+            ranked = sorted(self.by_sku, key=lambda s: (-self.visits[s], -self.demand[s]))
+        else:  # items
+            ranked = sorted(self.by_sku, key=lambda s: (-self.demand[s], -self.visits[s]))
+        mid = sum(x for x, _ in m.by_row[SLOT_ROWS[0]]) / len(m.by_row[SLOT_ROWS[0]])
+        robots = {r.pos for r in self.robots}
+        free: dict[Coords, list[Coords]] = {}
+        for y in SLOT_ROWS:
+            key = (lambda s: abs(s[0] - mid)) if self.fill_order == "middle" else (lambda s: s[0])
+            for s in sorted(m.by_row[y], key=key):
+                if s not in robots:
+                    free.setdefault(m.side_off[s], []).append(s)
+        layout = {p.id: free[m.side_off[p.pos]].pop(0) for sku in ranked for p in self.by_sku[sku]}
+        groups: dict[tuple, list[int]] = {}
+        for pid, s in layout.items():
+            groups.setdefault((s[1], m.side_off[s]), []).append(pid)
+        for pids in groups.values():
+            slots = [layout[pid] for pid in pids]
+            cost = [[0 if self.entities[pid].pos == s else 1000 + m.between[self.entities[pid].pos][s] for s in slots]
+                    for pid in pids]
+            rows, cols = linear_sum_assignment(cost)
+            for i, j in zip(rows, cols):
+                layout[pids[i]] = slots[j]
+        return layout
+
+    def relocate_all(self, verbose: bool = True) -> None:
+        """Move every pallet to its `target_layout` slot before any order is planned. The robot with the earliest
+        frontier takes the next trip (`relocation_task`). A move is ready once nothing (still) stands in its target
+        slot. If every remaining move waits on another (a cycle), one of them is re-targeted to a free slot."""
+        target = self.target_layout()
+        pending = {pid: s for pid, s in target.items() if self.entities[pid].pos != s}
+        if verbose:
+            print(f"  presort: {len(pending)} of {len(target)} pallets to move")
+        robots = self.robots
+        while pending:
+            occupied = {p.pos for p in self.pallets}
+            ready = [(self.entities[pid], s) for pid, s in pending.items() if s not in occupied]
+            if not ready:
+                self._break_cycle(pending, occupied)
+                continue
+            robot = min(robots, key=lambda r: r.frontier[-1][1])
+            if not self.execute(robot, (TaskType.RELOCATE, self.relocation_task(robot, ready))):
+                inv, t = robot.frontier[-1]
+                robot.frontier.append((inv, t + IDLE_STEP))
+                continue
+            for pid in [pid for pid, s in pending.items() if self.entities[pid].pos == s]:
+                del pending[pid]
+        self.presort_end = max(r.frontier[-1][1] for r in robots)
+        if self.barrier:
+            for r in robots:
+                r.frontier.append(((), self.presort_end))
+        if verbose:
+            print(f"  presort done by t={self.presort_end}: {self.relocations} pallets in "
+                  f"{self.relocation_trips} trips")
+
+    def _break_cycle(self, pending: dict[int, Coords], occupied: set[Coords]) -> None:
+        m = self.map
+        robots = {r.pos for r in self.robots}
+        spare = [s for s in m.slots if s not in occupied and s not in pending.values() and s not in robots]
+        pid, s = min(((pid, s) for pid in pending for s in spare if m.side_off[s] == m.side_off[pending[pid]]),
+                     key=lambda o: abs(o[1][1] - pending[o[0]][1]) + abs(o[1][0] - pending[o[0]][0]))
+        pending[pid] = s
+
+    def relocation_task(self, robot: Robot, ready: list[tuple[Pallet, Coords]]) -> list:
+        """Options for `robot`'s next presort trip, best first. Seed: the ready move with the shortest trip. If
+        pairing, also consider each ready move on the other side of a column pair as a second pallet (it rides in
+        the robot's other side slot), in either docking and either undocking order. The best pair is offered first
+        if it beats doing the two moves one after the other by `pair_margin`; the seed alone is the fallback."""
+        m = self.map
+
+        def cost(docks, dests):
+            c, cur = m.dist_to_pallet(docks[0].pos, robot.pos), docks[0].pos
+            for q in docks[1:]:
+                c, cur = c + m.between[cur][q.pos], q.pos
+            for _, s in dests:
+                c, cur = c + m.between[cur][s], s
+            return c, int(m.to_parking[m.side[cur]])
+
+        def single(p, s):
+            walk, park = cost([p], [(p, s)])
+            return walk + park, walk
+
+        p, s = min(ready, key=lambda o: single(*o)[0])
+        options = [((p,), ((p, s),))]
+        if not self.pair:
+            return options
+        _, seed_walk = single(p, s)
+        best = None
+        for q, qs in ready:
+            if m.side_off[q.pos] == m.side_off[p.pos]:
+                continue
+            # the two moves done back to back: seed, then from its slot fetch q and put it in place
+            apart = seed_walk + m.between[s][q.pos] + m.between[q.pos][qs] + int(m.to_parking[m.side[qs]])
+            for docks in ((p, q), (q, p)):
+                for dests in (((p, s), (q, qs)), ((q, qs), (p, s))):
+                    walk, park = cost(docks, dests)
+                    if walk + park <= apart - self.pair_margin and (best is None or walk + park < best[0]):
+                        best = (walk + park, docks, dests)
+        if best is not None:
+            options.insert(0, best[1:])
+        return options
+
     # ------------------------------------------------------------------ re-slotting replenished pallets
 
     def orders_served(self, p: Pallet) -> float:
@@ -542,6 +670,9 @@ class Manager:
             attempts = [lambda: self._plan_order(robot, Counter(task[1]), t0)]
         elif task[0] is TaskType.CARRY:
             attempts = [lambda: self._plan_carry(robot, task[1], t0)]
+        elif task[0] is TaskType.RELOCATE:
+            attempts = [lambda o=o: self._plan_replenish(robot, list(o[0]), t0, refill=False, dests=list(o[1]))
+                        for o in task[1]]
         else:
             seq, fallback, carry_off = task[1]
             seqs = [seq] if seq == fallback else [seq, fallback]
@@ -698,11 +829,15 @@ class Manager:
 
         return reservations, actions, frontiers, path[-1], commit
 
-    def _plan_replenish(self, robot: Robot, seq: list[Pallet], t0: int, carry_off: Coords = ABOVE):
+    def _plan_replenish(self, robot: Robot, seq: list[Pallet], t0: int, carry_off: Coords = ABOVE,
+                        refill: bool = True, dests: list[tuple[Pallet, Coords]] | None = None):
         """Trip to the replenishment row: flip the carried pallet to `carry_off` (above or to one side), dock `seq` in order (each from
         its side access cell, into the slot that leaves it at its home offset), refill, then undock them in reverse
         order. Reversing makes every undock footprint identical to the matching dock footprint, which was valid.
-        Finally flip the carried pallet back below and park."""
+        Finally flip the carried pallet back below and park.
+
+        Presort relocation reuses this: refill=False skips the replenishment row, and `dests` gives the
+        (pallet, slot) undock order instead of reversed docking order and `choose_slot`."""
         actions, reservations, frontiers = [], [], []
         rid = robot.id
         foot = self._foot(robot)
@@ -733,17 +868,23 @@ class Manager:
 
         # 3. drag everything to the replenishment row. The refill fires at the end of the timestep in which the
         #    robot moves onto row 39, so it can turn straight round on the next timestep.
-        path, ta = self._walk(foot, pos, t, lambda c: c[1] == REPLENISH_ROW, lambda ta: ta, self.map.to_replenish)
-        self._moves(path, t, actions, reservations, foot)
-        pos, t = path[-1], ta
+        if refill:
+            path, ta = self._walk(foot, pos, t, lambda c: c[1] == REPLENISH_ROW, lambda ta: ta, self.map.to_replenish)
+            self._moves(path, t, actions, reservations, foot)
+            pos, t = path[-1], ta
+        dock_time = {q.id: td for q, td in docked}
+        if dests is None:
+            dests = [(q, None) for q, _ in reversed(docked)]
 
         # 4. put each pallet in a slot (`choose_slot`: possibly not the one it came from), last docked first.
         #    A new slot is parked in the reservation table while the rest of the trip is planned, so the robot's
         #    later legs route round it; that is undone afterwards and redone on commit.
         returned, tentative = [], []
         try:
-            for q, td in reversed(docked):
-                slot = self.choose_slot(q, pos, t, {s for _, _, _, s in returned})
+            for q, slot in dests:
+                td = dock_time[q.id]
+                if slot is None:
+                    slot = self.choose_slot(q, pos, t, {s for _, _, _, s in returned})
                 side = self.map.side[slot]
                 path, ta = self._walk(foot, pos, t, lambda c, s=side: c == s, lambda ta: ta + 1,
                                       self._heuristic_cell(side))
@@ -779,14 +920,19 @@ class Manager:
             for q, td, tu, slot in returned:
                 self.reservations.unpark(*q.pos, td + 1)
                 moved |= slot != q.pos
-                self.moved += slot != q.pos
+                self.moved += refill and slot != q.pos
                 q.pos = slot
-                q.planned_count = q.max_count
+                if refill:
+                    q.planned_count = q.max_count
                 q.locked_until = tu
             if moved and self.live_map:
                 self.map.relayout({p.pos for p in self.pallets if p.carrier is None})
                 self._cell_bfs.clear()
                 self._spot_bfs.clear()
+            if not refill:
+                self.relocation_trips += 1
+                self.relocations += len(returned)
+                return
             if robot.carry is not None:
                 self.entities[robot.carry].planned_count = self.entities[robot.carry].max_count
             self.trips += 1

@@ -1,21 +1,22 @@
 # Solution Overview
 
-**Result:** all 1,000 orders fulfilled in **62,398 timesteps** (`--rank-tour`). Checked with `validate.py`.
+**Result:** all 1,000 orders fulfilled in **58,940 timesteps** (defaults: presort with 2-pallet trips, window 20). Checked with `validate.py`.
 
 ```
-python3 solve.py [BIG_ORDER.txt] [solution.txt] --rank-tour   # 62,398, ~4 min
-python3 solve.py [BIG_ORDER.txt] [solution.txt]               # 63,019, ~50 s
+python3 solve.py [BIG_ORDER.txt] [solution.txt]               # 58,940, ~50 s
 python3 validate.py [BIG_ORDER.txt] [solution.txt]            # independent rule check
-python3 solve.py ... --reslot packed                           # re-slot pallets on refill (64,275; see below)
+python3 solve.py ... --no-presort --window 10 --rank-tour     # previous best without presort: 62,398, ~4 min
+python3 solve.py ... --no-presort --window 10 --reslot packed # re-slot pallets on refill instead (64,275; see below)
 ```
 
 ## Approach
 
-A basic queue-based allocator with cooperative (space-time) A* path planning:
+A basic queue-based allocator with cooperative (space-time) A* path planning. First, every pallet is moved into a
+layout sorted by SKU popularity (see *Presort* below). Then:
 
 1. **Pick the robot.** Choose the robot whose *frontier* (the timestep its last planned task ends) is smallest.
 2. **Pick the task.**
-   - **Order:** scan the order queue for the first `window` (10) orders that the stock on the map can fully satisfy. Assign the one with the shortest estimated path from this robot. The estimate is a greedy nearest-pallet tour that ends on the fulfilment row.
+   - **Order:** scan the order queue for the first `window` (20) orders that the stock on the map can fully satisfy. Assign the one with the shortest estimated path from this robot. The estimate is a greedy nearest-pallet tour that ends on the fulfilment row.
    - **Replenish:** only when *no* order in the whole queue can be satisfied. Every non-full pallet of a SKU that is short for the head-of-queue orders is a candidate. The candidate chosen is the one whose refill gives the lowest estimated movement cost for those orders. Each item still unavailable after the refill adds a large penalty (1000) to the cost. In effect, the refill that unblocks the most demand wins, and travel time breaks ties.
 3. **Plan it.** Plan each leg of the task with space-time A* against a reservation table that holds every trajectory already committed. The legs are walk to a pallet, then hold there while picking (or docking), and so on. The plan is committed only if every leg is found. Otherwise the robot idles for 10 timesteps and is retried.
 4. Repeat until the queue is empty, then write all actions sorted by `(timestep, robot)`.
@@ -48,6 +49,50 @@ average, and it is longer on 37% of orders. Two things erode it:
 Taking the shorter tour per order is what pays off. The sweep's local search costs about 20 ms per call, so by default
 it runs only for the order being planned. `--rank-tour` also runs it for each of the `window` candidates, which takes
 about 5× as long.
+
+### Presort: moving every pallet to the sorted layout first (on by default; `--no-presort` turns it off)
+
+Before any order is planned, every pallet is moved to its slot in the `packed` layout (described under re-slotting
+below):
+
+- **Target layout (`target_layout`).**
+  - SKUs are ranked by how many orders use them, ties broken by items.
+  - Their pallets fill the slot rows top-down: y=3–16, then y=20–32. Within a row, the middle columns fill first.
+  - Each pallet stays on its side of a column pair, because it keeps its docking offset. Cells where robots start are left empty.
+  - Within each row, the pallets bound for it are matched to its slots (Hungarian, `scipy.optimize`) so the fewest move and the rest travel least.
+  - Result: 233 of 240 pallets move. The 240 pallets fill rows down to y=26.
+- **Ordering.** A move is *ready* once nothing still stands in its target slot. Its occupant must already have been
+  scheduled to leave, and A* waits for that departure through the reservation table. If every remaining move waits
+  on another (a cycle; 3 exist), one of them is re-targeted to the nearest spare slot on its row and side.
+- **Trips (`relocation_task`).** These reuse the replenishment trip planner, `_plan_replenish(refill=False, dests=...)`:
+  dock, carry, undock and park, but no visit to row 39.
+  - The robot with the earliest frontier takes the ready move with the shortest estimated trip.
+  - Like batched replenishment, it may take a second pallet in its other side slot. The candidate is any ready move whose pallet is on the opposite side of a column pair.
+  - The best pair, over both docking and both undocking orders, is used if it is estimated at least `--pair-margin` (0) steps shorter than doing the two moves one after the other.
+  - If the pair can't be planned, the robot falls back to the single move.
+- Distance tables are recomputed after every trip, as with re-slotting.
+- Replenishment afterwards returns each pallet to its (new) slot.
+
+| Variant | Presort done by | Makespan |
+|---|---|---|
+| No presort (window 10, same tours) | | 63,019 |
+| Presort, 1 pallet per trip (233 trips), window 10 | t=2,382 | 60,411 |
+| Presort, up to 2 pallets per trip (121 trips), window 10 | t=1,765 | 59,802 |
+| *Pallets* start *in the packed layout (window 10)* | *0* | *58,717* |
+| Pairs + window 20 (**default**) | t=1,765 | **58,940** |
+| Pairs + window 5 / 15 / 25 / 30 | | 59,782 / 59,719 / 59,278 / 59,362 |
+| Pairs + window 20 + strict barrier (no order until every move ends) | | 59,126 |
+| Pairs + window 20 + rank SKUs by items | | 59,604 |
+| Pairs + window 20 + rows filled left-to-right | | 59,278 |
+| Pairs + window 20, pair margin −10 | t=1,758 | 59,206 |
+| Pairs, window 10, pair margin 10 / 25 | t=1,797 / t=1,893 | 59,831 / 60,235 |
+| Pairs + window 20 + `--rank-tour` (~10 min) | | 59,156 |
+| Pairs + window 10, greedy tours only | | 60,557 |
+
+Pairing almost halves the trips and saves about 600 timesteps of presort. The presort costs about 1,100 timesteps
+of makespan against starting in the sorted layout (59,802 vs 58,717). That is less than its own duration, because
+robots start picking from the half-built layout while the last moves land. A strict barrier (`--barrier`) made
+no reliable difference. `--rank-tour` no longer helps once the layout is sorted.
 
 ### Re-slotting pallets on replenishment (`--reslot`, off by default)
 
@@ -112,7 +157,7 @@ rows (7–16, 23–32) doesn't help either (216.6). The gain comes from filling 
 | [objects.py](objects.py) | `Robot` and `Pallet` dataclasses (`planned_count`, `locked_until`, `last_pick`) and frontier types |
 | [navigation.py](navigation.py) | `ReservationTable` (`[x, y, t]` occupancy, plus a permanent layer for resting pallets and parked robots) and `StaticMap` (distance tables keyed by slot cell, used for A* heuristics and route estimates; `relayout` recomputes them with scipy when pallets change slot) |
 | [coopastar.py](coopastar.py) | Space-time A*. It supports a multi-cell footprint (robot plus docked pallet) and "arrive, then hold for N steps" goals |
-| [manager.py](manager.py) | Queue allocation, route and replenishment heuristics, task planning, solution writer |
+| [manager.py](manager.py) | Presort (target layout, relocation trips), queue allocation, route and replenishment heuristics, task planning, solution writer |
 | [solve.py](solve.py) | Entry point |
 | [validate.py](validate.py) | Simulator of the README rules. Stricter than required where the README is ambiguous |
 
@@ -126,30 +171,31 @@ These are chosen to be safe under any reading of the rules. Each costs some time
 
 ## Where the time goes
 
-Measured on the current best `solution.txt` (62,398, `--rank-tour`, no re-slotting):
+Measured on the current best `solution.txt` (58,940, defaults):
 
-| Robot-timesteps (5 robots × 62,398 = 312k) | Count | Share |
+| Robot-timesteps (5 robots × 58,940 = 295k) | Count | Share |
 |---|---|---|
-| Moves | 235,183 | 75.4% |
-| Picks (fixed by the problem) | 64,506 | 20.7% |
-| Fulfil, dock, undock | 1,470 | 0.5% |
-| No action (waiting, including the tail after a robot's last task) | 10,831 | 3.5% |
-| Dragging docked pallets, dock → undock (overlaps with moves) | 11,193 | 3.6% |
+| Moves | 218,930 | 74.3% |
+| … of which presort moves (before t=1,765) | 8,220 | 2.8% |
+| Picks (fixed by the problem) | 64,506 | 21.9% |
+| Fulfil, dock, undock (233 presort docks and undocks included) | 1,936 | 0.7% |
+| No action (waiting, including the tail after a robot's last task) | 9,328 | 3.2% |
+| Dragging docked pallets, dock → undock (overlaps with moves) | 16,797 | 5.7% |
 
-Robots finish between t=62,064 and t=62,397.
+Robots finish between t=58,637 and t=58,939. The presort occupies about 8,800 robot-timesteps (5 × 1,765) and
+saves about 23,000 order and replenishment moves (window 10: 236,580 without presort vs 213,401 after it).
 
-On average an order visits about 37 distinct SKUs and takes about 235 moves of travel against about 65 picks. Robots finish within about 335 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742 (measured before the row-39 wait was removed). Dropping the 213 one-step waits changed the makespan by +147. The greedy allocator is sensitive to small timing shifts, so differences of a few hundred timesteps are noise rather than signal.
+On average an order visits about 37 distinct SKUs and takes about 211 moves of travel against about 65 picks. Robots finish within about 300 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742 (measured before the row-39 wait was removed). Dropping the 213 one-step waits changed the makespan by +147. The greedy allocator is sensitive to small timing shifts, so differences of a few hundred timesteps are noise rather than signal.
 
 ## Recommendations (ordered by expected impact)
 
 1. **Carry the high runners.** A robot can dock up to 4 pallets and pick from them with no travel. Demand is Zipf-shaped: SKU 0 alone is 7,824 of 64,506 items (12%), and the top few SKUs appear in almost every order. Each robot could carry 2–3 high-runner pallets for the whole run and refill them by passing along row 39. This removes the most frequent stops from every tour. This needs footprint-aware A*, which `coopastar.plan` already supports through `offsets`.
-2. **Re-layout the floor up front.** Re-slotting on refill is implemented (`--reslot`) but loses about 1,250
-   timesteps, because the half-migrated layout is worse than the start (see above). The packed end state is worth
-   about 4,300 timesteps (58,717 if pallets start there), so migrating there *early* in dedicated passes should pay
-   off. That means about 200 pallet moves, roughly 2,000 makespan if spread over 5 robots, while the robots are
-   otherwise idle at the start or interleaved with the first orders. Then keep re-slotting on refill to hold the
-   layout. A layout-aware slot test (the change in estimated tour cost over upcoming orders, rather than vertical
-   gain × orders) would stop refills from making the transient layout worse.
+2. **Optimise the target layout itself.** Presort is implemented and it is now the largest single gain. The
+   layout is still the simple rank-by-row `packed` one. A local search over pallet swaps, scored by the static
+   estimate (average tour over the orders, full stock), could find a better one. For example, it could spread a SKU's
+   duplicates across aisles, or put the SKUs that are ordered together in the same aisle. Presort cost barely depends on
+   which layout is targeted.
+   Docking end-of-column pallets from above or below would also let a presort trip carry 3–4 pallets.
 3. **Better tours.** The S-shaped sweep is implemented (see above), and the per-order better of sweep and greedy saves
    about 1,400 timesteps. Next steps:
    - Run 2-opt/or-opt over the static distance tables on whichever tour wins.

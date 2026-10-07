@@ -1,20 +1,21 @@
 """Usage: python solve.py [worklist] [solution] [--window N] [--carry] [--alpha A] [--max-detour D] [--max-fill F]
                    [--future-trip K] [--min-items-per-step N] [--trip-slot above|side]
                    [--tour greedy|sweep|best] [--rank-tour]
-                   [--reslot off|packed|linear] [--max-shift N] [--fill-weight W]"""
+                   [--reslot off|packed|linear] [--max-shift N] [--fill-weight W]
+                   [--no-presort] [--no-pair] [--pair-margin M] [--barrier]"""
 
 import argparse
 import time
 
 from manager import (ALPHA, FILL_WEIGHT, FUTURE_TRIP, MAX_DETOUR, MAX_FILL, MAX_SHIFT, MIN_ITEMS_PER_STEP,
-                     Manager)
+                     PAIR_MARGIN, Manager)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("worklist", nargs="?", default="BIG_ORDER.txt")
     ap.add_argument("solution", nargs="?", default="solution.txt")
-    ap.add_argument("--window", type=int, default=10, help="how many feasible queue-head orders to compare")
+    ap.add_argument("--window", type=int, default=20, help="how many feasible queue-head orders to compare")
     ap.add_argument("--carry", action="store_true", help="give each robot a top-SKU pallet to carry all run")
     ap.add_argument("--alpha", type=float, default=ALPHA, help="steps of detour worth refilling 100%% of a SKU's demand")
     ap.add_argument("--max-detour", type=float, default=MAX_DETOUR, help="max estimated steps added per extra pallet")
@@ -36,6 +37,13 @@ def main() -> None:
                     help="columns a re-slotted pallet may move sideways before its detour must pay for itself")
     ap.add_argument("--fill-weight", type=float, default=FILL_WEIGHT,
                     help="steps saved per order served, per step a new slot is nearer the fulfilment row")
+    ap.add_argument("--no-presort", action="store_true",
+                    help="skip moving every pallet to the packed layout (high runners nearest row 0) before any order")
+    ap.add_argument("--barrier", action="store_true",
+                    help="presort: no robot starts an order until every pallet move has finished")
+    ap.add_argument("--no-pair", action="store_true", help="presort: move one pallet per trip")
+    ap.add_argument("--pair-margin", type=float, default=PAIR_MARGIN,
+                    help="presort: steps a 2-pallet trip must save over two separate moves")
     args = ap.parse_args()
 
     start = time.time()
@@ -43,9 +51,13 @@ def main() -> None:
                 max_detour=args.max_detour, max_fill=args.max_fill,
                 future_trip=args.future_trip, min_items_per_step=args.min_items_per_step,
                 trip_slot=args.trip_slot, tour_mode=args.tour, rank_tour=args.rank_tour,
-                reslot=args.reslot, max_shift=args.max_shift, fill_weight=args.fill_weight)
+                reslot=args.reslot, max_shift=args.max_shift, fill_weight=args.fill_weight,
+                presort=not args.no_presort, pair=not args.no_pair, pair_margin=args.pair_margin,
+                barrier=args.barrier)
     makespan = m.solve()
     m.write_solution(args.solution)
+    if m.presort:
+        print(f"presort: {m.relocations} pallets moved in {m.relocation_trips} trips, done by t={m.presort_end}")
     print(f"makespan {makespan} timesteps, {m.trips} trips, {m.replenishments} replenishments ({m.moved} re-slotted), "
           f"wrote {args.solution} in {time.time() - start:.1f}s")
 
