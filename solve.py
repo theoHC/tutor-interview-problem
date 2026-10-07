@@ -44,6 +44,12 @@ def main() -> None:
     ap.add_argument("--no-pair", action="store_true", help="presort: move one pallet per trip")
     ap.add_argument("--pair-margin", type=float, default=PAIR_MARGIN,
                     help="presort: steps a 2-pallet trip must save over two separate moves")
+    ap.add_argument("--select", choices=("raw", "marginal", "per-item"), default="raw",
+                    help="order ranking: raw travel, travel minus its cost from the fulfilment row, or travel per item")
+    ap.add_argument("--assign", choices=("frontier", "central"), default="frontier",
+                    help="frontier: earliest robot picks its order; central: pick the best (robot, order) pair")
+    ap.add_argument("--slack", type=int, default=0, help="central: robots this many steps past the earliest compete")
+    ap.add_argument("--lag-weight", type=float, default=1.0, help="central: score penalty per step of robot lag")
     args = ap.parse_args()
 
     start = time.time()
@@ -53,7 +59,8 @@ def main() -> None:
                 trip_slot=args.trip_slot, tour_mode=args.tour, rank_tour=args.rank_tour,
                 reslot=args.reslot, max_shift=args.max_shift, fill_weight=args.fill_weight,
                 presort=not args.no_presort, pair=not args.no_pair, pair_margin=args.pair_margin,
-                barrier=args.barrier)
+                barrier=args.barrier, select=args.select, assign=args.assign, slack=args.slack,
+                lag_weight=args.lag_weight)
     makespan = m.solve()
     m.write_solution(args.solution)
     if m.presort:

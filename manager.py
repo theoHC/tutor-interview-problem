@@ -90,7 +90,8 @@ class Manager:
                  tour_mode: str = "best", rank_tour: bool = False, reslot: str = "off",
                  max_shift: float = MAX_SHIFT, fill_weight: float = FILL_WEIGHT, live_map: bool = True,
                  presort: bool = False, pair: bool = True, pair_margin: float = PAIR_MARGIN,
-                 barrier: bool = False, rank_by: str = "visits", fill_order: str = "middle"):
+                 barrier: bool = False, rank_by: str = "visits", fill_order: str = "middle",
+                 select: str = "raw", assign: str = "frontier", slack: int = 0, lag_weight: float = 1.0):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
@@ -105,6 +106,7 @@ class Manager:
         self.presort, self.pair, self.pair_margin = presort, pair, pair_margin
         self.barrier = barrier  # no robot starts an order until every presort move has finished
         self.rank_by, self.fill_order = rank_by, fill_order  # target_layout variants
+        self.select, self.assign, self.slack, self.lag_weight = select, assign, slack, lag_weight
         assert not (presort and carry), "presorting assumes no robot carries a pallet"
         self._load(path)
         self.reservations = ReservationTable(self.entities)
@@ -161,7 +163,10 @@ class Manager:
         done = 0
         while self.tasks:
             robot = min(robots, key=lambda r: r.frontier[-1][1])
-            task = self.select_task(robot)
+            if self.assign == "central":
+                robot, task = self.select_joint(robot)
+            else:
+                task = self.select_task(robot)
             ok = False
             if task is not None:
                 ok = self.execute(robot, task)
@@ -227,7 +232,7 @@ class Manager:
                 s[p.sku] += p.planned_count
         return s
 
-    def select_task(self, robot: Robot) -> Task | None:
+    def _candidates(self, robot: Robot) -> list[Task]:
         stock = self.stock(robot)
         candidates = []
         for task in self.tasks:
@@ -236,12 +241,50 @@ class Manager:
                 candidates.append(task)
                 if len(candidates) == self.window:
                     break
+        return candidates
+
+    def _score(self, task: Task, robot: Robot, t0: int, base: dict) -> float:
+        """Lower is better. raw: estimated travel from the robot. marginal: that minus what the order would cost from
+        the fulfilment row (the extra travel this robot's position adds). per-item: travel per item."""
+        need = Counter(task[1])
+        estimate = self.tour if self.rank_tour else lambda need, pos, t, r: self.route(need, pos, t, robot=r)
+        travel = estimate(need, robot.pos, t0, robot)[1]
+        if self.select == "marginal":
+            if task not in base:
+                base[task] = self.route(need, None)[1]
+            return travel - base[task]
+        if self.select == "per-item":
+            return travel / len(task[1])
+        return travel
+
+    def select_joint(self, first: Robot) -> tuple[Robot, Task | None]:
+        """Choose robot and order together: every robot within `slack` of the earliest frontier is scored against every
+        candidate order; its lag behind the earliest robot (x lag_weight) is added to the score. When no order is
+        feasible, fall back to the earliest robot's replenishment."""
+        candidates = self._candidates(first)
+        if not candidates:
+            return first, self.select_task(first)
+        tmin = first.frontier[-1][1]
+        base: dict = {}
+        best = None
+        for r in self.robots:
+            t0 = r.frontier[-1][1]
+            if t0 - tmin > self.slack:
+                continue
+            for task in candidates:
+                c = self._score(task, r, t0, base) + self.lag_weight * (t0 - tmin)
+                if best is None or c < best[0]:
+                    best = (c, r, task)
+        return best[1], best[2]
+
+    def select_task(self, robot: Robot) -> Task | None:
+        candidates = self._candidates(robot)
         carried = self.entities[robot.carry] if robot.carry is not None else None
         if candidates:
             t0 = robot.frontier[-1][1]
-            # shortest estimated path wins (rank_tour: the tour that would actually be planned; slower)
-            estimate = self.tour if self.rank_tour else lambda need, pos, t, r: self.route(need, pos, t, robot=r)
-            task = min(candidates, key=lambda task: estimate(Counter(task[1]), robot.pos, t0, robot)[1])
+            # lowest score wins (rank_tour: the tour that would actually be planned; slower)
+            base: dict = {}
+            task = min(candidates, key=lambda task: self._score(task, robot, t0, base))
             if carried is not None and task[1].count(carried.sku) > carried.planned_count:
                 return self.replenish_task(robot, None)
             return task

@@ -26,4 +26,8 @@ Yeah the constant thread on these is that the cost of the optimization kills the
 
 Hmmm... potentially, starting sorting could save me about 2000 moves. Let's give it a shot.
 
-HAHA WE'RE SUB-60K!!!!!! Nice. Just moving everything up towards the top and sorting by pick frequency really helped. It's not quite as much as I'd hoped, but the net result is that principled optimizations saved me about 10% from my start.
+HAHA WE'RE SUB-60K (58940)!!!!!! Nice. Just moving everything up towards the top and sorting by pick frequency really helped. It's not quite as much as I'd hoped, but the net result is that principled optimizations saved me about 10% from my start. Thinking about heuristics for doubling up pallet dragging earlier helped here, I think, since "can I efficiently snag a second pallet while I'm passing by" is a very useful question in pre-sorting.
+
+Now, let's see if there's any juice in smarter allocation of tasks (e.g. sort them by marginal extra movement needed) and in assigning tasks centrally.
+
+...aaaaaand nope. I bet for a smaller number of larger tasks, centralized assignment would help, but since each robot does a large number of small tasks, my naive approach turns out to be the best. Let's try some Claude-suggested changes to the planner (windowed and conflict based replanning)

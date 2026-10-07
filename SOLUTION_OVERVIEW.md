@@ -133,6 +133,28 @@ average tour. The heuristic counts each visit as its own trip from row 0, so it 
 served are 27–150 per refill, which is why fill weight barely matters. Sorting by popularity within the original
 rows (7–16, 23–32) doesn't help either (216.6). The gain comes from filling rows 3–6 with high runners.
 
+### Order ranking and central robot assignment (`--select`, `--assign`; defaults unchanged)
+
+Two variants of recommendation 5 were tried. Neither beat the default (58,940), so the defaults stay `raw` and `frontier`.
+
+- **`--select`** ranks the `window` candidates. `raw` is the estimated travel from the robot (default). `marginal` is that travel minus the order's estimated cost from the fulfilment row, so it measures only what the robot's position adds. `per-item` is travel divided by items.
+- **`--assign central`** chooses the (robot, order) pair together. Every robot within `--slack` steps of the earliest frontier is scored against every candidate: `score + lag_weight × (its frontier − earliest frontier)`. If no order is feasible, the earliest robot replenishes as before.
+
+| Variant | Makespan |
+|---|---|
+| Default (`raw`, earliest-frontier robot) | **58,940** |
+| `--select marginal` / `per-item` | 60,137 / 59,984 |
+| Central, slack 10, lag 1 | 58,942 |
+| Central, slack 20, lag 1 / 0.5 / 2 | 59,106 / 59,168 / 59,396 |
+| Central, slack 20, lag 1, window 30 | 59,067 |
+| Central, slack 5, lag 1 | 59,414 |
+| Central, slack 10, lag 1, window 10 | 60,031 |
+| Central, slack 10, lag 2 | 59,313 |
+| Central, slack 60 / 200, lag 1 | 59,548 |
+| Central, slack 60, lag 1, `marginal` | 59,630 |
+
+Marginal and per-item ranking lose about 1,000–1,200. Central assignment is at best level with the default (slack 10: +2, within noise), and a wider slack is worse. Robots already finish within about 300 timesteps of each other, so there is little imbalance for joint assignment to fix. Letting a later-frontier robot plan first also fits worse into the prioritised reservation table.
+
 ### What each task does
 
 - **Order:** visit pallets in greedy nearest-first order and pick the required quantity at each. Then go to the fulfilment row, fulfil, and park there.
@@ -209,6 +231,6 @@ On average an order visits about 37 distinct SKUs and takes about 211 moves of t
    - Dock several depleted pallets in one trip.
    - Include the replenisher's own travel in the pallet score.
    - Fold a refill into an order tour when the robot passes near row 39.
-5. **Smarter order selection.** Score orders by travel *per item* or by marginal travel given the current position, rather than raw path length. The raw measure favours small orders now and leaves expensive ones for the end. Selecting orders for all robots jointly would also beat the earliest-frontier greedy.
+5. **Smarter order selection.** Tried and did not help (see *Order ranking and central robot assignment*): marginal and per-item ranking are 1,000+ worse, and joint robot-order assignment ties the default at best. A different angle would be looking ahead (choosing orders that leave stock and positions good for the next ones).
 6. **Relax the no-following rule once confirmed.** Allow follow-the-leader moves if the testbench accepts them. This is a small win: tens to hundreds of timesteps.
 7. **Planner robustness and speed.** Prioritised planning never revises a committed plan. Windowed replanning or conflict-based search would recover the waits that come from planning order. The Python A* is fast enough now (about 16 s per solve), but ideas 1–3 add search. Porting the inner loop to numba, or caching heuristics, will keep iteration quick.
