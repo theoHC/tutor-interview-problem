@@ -6,6 +6,7 @@
 python3 solve.py [BIG_ORDER.txt] [solution.txt] --rank-tour   # 62,398, ~4 min
 python3 solve.py [BIG_ORDER.txt] [solution.txt]               # 63,019, ~50 s
 python3 validate.py [BIG_ORDER.txt] [solution.txt]            # independent rule check
+python3 solve.py ... --reslot packed                           # re-slot pallets on refill (64,275; see below)
 ```
 
 ## Approach
@@ -48,6 +49,45 @@ Taking the shorter tour per order is what pays off. The sweep's local search cos
 it runs only for the order being planned. `--rank-tour` also runs it for each of the `window` candidates, which takes
 about 5× as long.
 
+### Re-slotting pallets on replenishment (`--reslot`, off by default)
+
+Instead of returning a refilled pallet to the slot it came from, it can be put in a slot whose row is set by its SKU.
+
+- **Slots.** Every cell of the six column pairs from y=3 to 16 (top block) and y=20 to 32 (bottom block). That leaves a
+  3-row gap at y=17–19. A pallet docked from the aisle keeps its offset, so it can only go into a column on the same side
+  of a pair (left or right) as the one it came from.
+- **Target row.** SKUs are ranked by how many orders use them (ties broken by items). `packed`: walking down the rows,
+  each SKU gets the row its pallets would fill if the blocks were filled in rank order (12 slots per row), so 240
+  pallets reach y=25. `linear`: ranks are spread evenly from y=3 to y=32.
+- **Choice (`choose_slot`).** Walk down the rows from the target row. On each row, take the open slot nearest the
+  robot. Open means on the right side, and nothing reserved in that cell from now on. If it is within `--max-shift` (7)
+  columns of the pallet's old slot, take it. Otherwise it must pay for its detour:
+  `fill_weight × (steps closer to the fulfilment row) × (orders the full pallet serves) − (extra steps to put it there
+  and park) > 0`. A slot that fails goes to the next row down. Reaching the pallet's own row puts it back where it was.
+- **Live distances.** Every map table is now keyed by slot cell. `StaticMap.relayout` recomputes them (scipy
+  `csgraph`, about 75 ms) whenever a commit moves a pallet. Stale tables cost about 1,200 timesteps (65,488 vs 64,287).
+
+| Variant (default greedy ranking unless noted) | Makespan | Moves | Re-slotted |
+|---|---|---|---|
+| `--reslot off` (pallets return home) | **63,019** | 236,580 | 0 |
+| `packed`, fill weight 4 | 64,275 | 244,659 | 68 |
+| `packed`, fill weight 0.25–2 | 64,287 | 244,641 | 68 |
+| `packed`, max shift 14 / 0 / 100 | 64,358 / 64,809 / 64,644 | | 65–70 |
+| `linear`, max shift 7 / 0 / 14 | 64,534 / 64,662 / 64,671 | | 70–73 |
+| `packed`, fill weight 4, `--rank-tour` | 64,233 (vs 62,398 off) | | 74 |
+| *Upper bound: pallets **start** in the packed layout, no re-slotting* | *58,717* | | |
+
+**Why it loses.** The end-state layout is good. On a static check (full stock, greedy tour from row 0, averaged
+over all orders), the fully packed layout averages 190.8 moves per order, against 212.7 for the starting layout.
+Starting the solve in it scores 58,717. But refills move only about 70 pallets over the whole run, and the
+half-migrated layout is *worse* than the start: 220.8 after 200 orders, 223.8 after 400, still 211.4 at the end.
+A tour still sweeps down the aisles for most SKUs, and a pallet in the middle of an aisle it passes anyway costs
+almost nothing. A lone pallet lifted to y=3 is an up-and-back detour from the top of the block on every tour that
+doesn't enter or leave through that aisle. Moving one SKU-0 pallet from (39,11) to (39,3) adds 2.4 moves to the
+average tour. The heuristic counts each visit as its own trip from row 0, so it accepts almost every move: orders
+served are 27–150 per refill, which is why fill weight barely matters. Sorting by popularity within the original
+rows (7–16, 23–32) doesn't help either (216.6). The gain comes from filling rows 3–6 with high runners.
+
 ### What each task does
 
 - **Order:** visit pallets in greedy nearest-first order and pick the required quantity at each. Then go to the fulfilment row, fulfil, and park there.
@@ -55,7 +95,7 @@ about 5× as long.
   1. Wait at the parking spot until just before the last pick already reserved on the pallet.
   2. Walk to a side access cell and dock.
   3. Drag the pallet to row 39. The refill fires at the end of the arrival timestep, so the robot turns straight round.
-  4. Drag it back to its home slot and undock.
+  4. Drag it back to its home slot (or, with `--reslot`, the slot `choose_slot` picks) and undock.
   5. Park in an open cell away from any pallet, so the robot never blocks an access cell.
 
 ### Stock bookkeeping (no over-picking)
@@ -70,7 +110,7 @@ about 5× as long.
 | File | Role |
 |---|---|
 | [objects.py](objects.py) | `Robot` and `Pallet` dataclasses (`planned_count`, `locked_until`, `last_pick`) and frontier types |
-| [navigation.py](navigation.py) | `ReservationTable` (`[x, y, t]` occupancy, plus a permanent layer for resting pallets and parked robots) and `StaticMap` (BFS distance tables used for A* heuristics and route estimates) |
+| [navigation.py](navigation.py) | `ReservationTable` (`[x, y, t]` occupancy, plus a permanent layer for resting pallets and parked robots) and `StaticMap` (distance tables keyed by slot cell, used for A* heuristics and route estimates; `relayout` recomputes them with scipy when pallets change slot) |
 | [coopastar.py](coopastar.py) | Space-time A*. It supports a multi-cell footprint (robot plus docked pallet) and "arrive, then hold for N steps" goals |
 | [manager.py](manager.py) | Queue allocation, route and replenishment heuristics, task planning, solution writer |
 | [solve.py](solve.py) | Entry point |
@@ -86,19 +126,30 @@ These are chosen to be safe under any reading of the rules. Each costs some time
 
 ## Where the time goes
 
-| Robot-timesteps (5 robots × 66,743 = 334k) | Count | Share |
-|---|---|---|
-| Moves | 252,274 | 76% |
-| Picks (fixed by the problem) | 64,506 | 19% |
-| Replenishment trips (whole task) | 30,528 | 9% (overlaps with moves) |
-| Waiting inside tasks | ~14,400 | 4% |
+Measured on the current best `solution.txt` (62,398, `--rank-tour`, no re-slotting):
 
-On average an order visits about 37 distinct SKUs and takes about 233 moves of travel against about 65 picks. Robots finish within about 345 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742 (measured before the row-39 wait was removed). Dropping the 213 one-step waits changed the makespan by +147. The greedy allocator is sensitive to small timing shifts, so differences of a few hundred timesteps are noise rather than signal.
+| Robot-timesteps (5 robots × 62,398 = 312k) | Count | Share |
+|---|---|---|
+| Moves | 235,183 | 75.4% |
+| Picks (fixed by the problem) | 64,506 | 20.7% |
+| Fulfil, dock, undock | 1,470 | 0.5% |
+| No action (waiting, including the tail after a robot's last task) | 10,831 | 3.5% |
+| Dragging docked pallets, dock → undock (overlaps with moves) | 11,193 | 3.6% |
+
+Robots finish between t=62,064 and t=62,397.
+
+On average an order visits about 37 distinct SKUs and takes about 235 moves of travel against about 65 picks. Robots finish within about 335 timesteps of each other, so load balance is not the problem. **Travel is.** The selection window only helps at the margin: window 1 gives 69,613, 10 gives 66,596, 30 gives 66,333 and 100 gives 66,742 (measured before the row-39 wait was removed). Dropping the 213 one-step waits changed the makespan by +147. The greedy allocator is sensitive to small timing shifts, so differences of a few hundred timesteps are noise rather than signal.
 
 ## Recommendations (ordered by expected impact)
 
 1. **Carry the high runners.** A robot can dock up to 4 pallets and pick from them with no travel. Demand is Zipf-shaped: SKU 0 alone is 7,824 of 64,506 items (12%), and the top few SKUs appear in almost every order. Each robot could carry 2–3 high-runner pallets for the whole run and refill them by passing along row 39. This removes the most frequent stops from every tour. This needs footprint-aware A*, which `coopastar.plan` already supports through `offsets`.
-2. **Re-slot pallets near the fulfilment row.** Rows 1–6 are entirely empty, and the pallet blocks start at y=7 and y=23. When a pallet is replenished, return it to a slot close to row 0 rather than to its home slot. Over time, move high-runner pallets from the lower band (y=23–32) to the top. Each order tour starts and ends on row 0, so every row closer saves about 2 moves per visit.
+2. **Re-layout the floor up front.** Re-slotting on refill is implemented (`--reslot`) but loses about 1,250
+   timesteps, because the half-migrated layout is worse than the start (see above). The packed end state is worth
+   about 4,300 timesteps (58,717 if pallets start there), so migrating there *early* in dedicated passes should pay
+   off. That means about 200 pallet moves, roughly 2,000 makespan if spread over 5 robots, while the robots are
+   otherwise idle at the start or interleaved with the first orders. Then keep re-slotting on refill to hold the
+   layout. A layout-aware slot test (the change in estimated tour cost over upcoming orders, rather than vertical
+   gain × orders) would stop refills from making the transient layout worse.
 3. **Better tours.** The S-shaped sweep is implemented (see above), and the per-order better of sweep and greedy saves
    about 1,400 timesteps. Next steps:
    - Run 2-opt/or-opt over the static distance tables on whichever tour wins.

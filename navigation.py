@@ -1,6 +1,8 @@
 from collections import deque
 
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 
 from objects import Coords, Pallet, Robot
 
@@ -100,46 +102,86 @@ def bfs(blocked: np.ndarray, sources: list[Coords]) -> np.ndarray:
     return dist
 
 
-class StaticMap:
-    """Distance lookups on the warehouse with every pallet at its home cell (robots ignored).
+# Rows pallets may be slotted into (in their original columns): two blocks with a 3-row gap (y=17-19) between them
+TOP_BLOCK = range(3, 17)
+BOTTOM_BLOCK = range(20, 33)
+SLOT_ROWS = (*TOP_BLOCK, *BOTTOM_BLOCK)
 
-    Used both as admissible-ish A* heuristics and for cheap route-cost estimates during task selection.
+
+class StaticMap:
+    """Distance lookups keyed by *slot* (a cell a pallet may stand in), robots ignored.
+
+    Pallets are re-slotted when replenished, so every table is keyed by cell rather than by pallet, and `relayout`
+    recomputes the distances whenever the set of occupied slots changes.
+    Used both as A* heuristics and for cheap route-cost estimates during task selection.
     """
 
-    def __init__(self, pallets: list[Pallet]):
-        self.blocked = np.zeros((WIDTH, HEIGHT), dtype=bool)
-        for p in pallets:
-            self.blocked[p.pos] = True
-        # cells a robot can stand on to pick from / dock to each pallet
-        self.access: dict[int, list[Coords]] = {
-            p.id: [c for c in adjacent(p.pos) if not self.blocked[c]] for p in pallets
-        }
-        self.to_pallet = {p.id: bfs(self.blocked, self.access[p.id]) for p in pallets}
-        self.to_fulfill = bfs(self.blocked, [(x, FULFILL_ROW) for x in range(WIDTH)])
-        self.to_replenish = bfs(self.blocked, [(x, REPLENISH_ROW) for x in range(WIDTH)])
-        # pallet-to-pallet travel: from the best access cell of a to the nearest access cell of b
-        ids = [p.id for p in pallets]
-        self.between = {a: {b: min(int(self.to_pallet[b][c]) for c in self.access[a]) for b in ids} for a in ids}
-        # fulfilment row -> pallet travel
-        self.from_top = {a: min(int(self.to_fulfill[c]) for c in self.access[a]) for a in ids}
-        # parking: open cells well away from any pallet so a resting robot never blocks an access cell
+    def __init__(self, pallets: list[Pallet], reslot: bool = True):
+        columns = sorted({p.pos[0] for p in pallets})
+        if reslot:
+            self.slots: list[Coords] = [(x, y) for y in SLOT_ROWS for x in columns]
+        else:  # pallets only ever stand where they started
+            self.slots = sorted({p.pos for p in pallets}, key=lambda s: (s[1], s[0]))
+        self.by_row: dict[int, list[Coords]] = {}
+        for s in self.slots:
+            self.by_row.setdefault(s[1], []).append(s)
+        assert all(p.pos in set(self.slots) for p in pallets), "a pallet starts outside the slot grid"
+        self.slot = np.zeros((WIDTH, HEIGHT), dtype=bool)
+        for s in self.slots:
+            self.slot[s] = True
+        # cells a robot can stand on to pick from / dock to a pallet in each slot: never another slot, as that may
+        # hold a pallet by the time the robot gets there
+        self.access: dict[Coords, list[Coords]] = {s: [c for c in adjacent(s) if not self.slot[c]] for s in self.slots}
+        # side access: slots stand in 2-wide column pairs, so each has exactly one access cell level with it.
+        # Docking from there puts the pallet on the robot's west or east side, and it keeps that offset, so a
+        # pallet can only ever be re-slotted into a column on the same side of its pair.
+        self.side = {s: next(c for c in self.access[s] if c[1] == s[1]) for s in self.slots}
+        self.side_off = {s: (s[0] - self.side[s][0], 0) for s in self.slots}
+        # parking: open cells well away from any slot so a resting robot never blocks an access cell
         self.parking = np.zeros((WIDTH, HEIGHT), dtype=bool)
         for x in range(WIDTH):
             for y in range(HEIGHT - 1):
                 lo_x, hi_x, lo_y, hi_y = max(0, x - 3), x + 4, max(0, y - 3), y + 4
-                self.parking[x, y] = not self.blocked[lo_x:hi_x, lo_y:hi_y].any()
-        self.to_parking = bfs(self.blocked, list(zip(*np.nonzero(self.parking))))
-        # side access: pallets stand in 2-wide column pairs, so each has exactly one access cell level with it.
-        # Docking from there puts the pallet on the robot's west or east side.
-        self.side = {p.id: next(c for c in self.access[p.id] if c[1] == p.pos[1]) for p in pallets}
-        self.side_off = {p.id: (p.pos[0] - self.side[p.id][0], 0) for p in pallets}
-        self.to_bottom = {a: min(int(self.to_replenish[c]) for c in self.access[a]) for a in ids}
+                self.parking[x, y] = not self.slot[lo_x:hi_x, lo_y:hi_y].any()
         # cells whose whole 3x3 neighbourhood is open, away from the parked rows at the edges: a robot can undock a
         # pallet here and walk round it to re-dock from another side
         self.open3 = np.zeros((WIDTH, HEIGHT), dtype=bool)
         for x in range(1, WIDTH - 1):
             for y in range(3, HEIGHT - 2):
-                self.open3[x, y] = not self.blocked[x - 1 : x + 2, y - 1 : y + 2].any()
+                self.open3[x, y] = not self.slot[x - 1 : x + 2, y - 1 : y + 2].any()
+        # every access cell once, grouped by slot (for the all-sources BFS in `relayout`)
+        self._acc = [c for s in self.slots for c in self.access[s]]
+        self._acc_start = np.cumsum([0] + [len(self.access[s]) for s in self.slots[:-1]])
+        self.relayout({p.pos for p in pallets})
 
-    def dist_to_pallet(self, pid: int, c: Coords) -> int:
-        return int(self.to_pallet[pid][c])
+    def relayout(self, occupied: set[Coords]) -> None:
+        """Recompute every distance table with exactly the slots in `occupied` blocked."""
+        self.blocked = np.zeros((WIDTH, HEIGHT), dtype=bool)
+        for c in occupied:
+            self.blocked[c] = True
+        # unweighted 4-connected grid graph over open cells; node id = x * HEIGHT + y (ravel order of [x, y] arrays)
+        idx = np.arange(WIDTH * HEIGHT).reshape(WIDTH, HEIGHT)
+        free = ~self.blocked
+        h = free[:-1, :] & free[1:, :]
+        v = free[:, :-1] & free[:, 1:]
+        src = np.concatenate([idx[:-1, :][h], idx[:, :-1][v]])
+        dst = np.concatenate([idx[1:, :][h], idx[:, 1:][v]])
+        graph = csr_matrix((np.ones(len(src)), (src, dst)), shape=(WIDTH * HEIGHT, WIDTH * HEIGHT))
+        acc = [x * HEIGHT + y for x, y in self._acc]
+        d = shortest_path(graph, directed=False, unweighted=True, indices=acc)
+        d = np.where(np.isinf(d), 10**6, d).astype(np.int32)
+        # nearest access cell of each slot, from every cell
+        per_slot = np.minimum.reduceat(d, self._acc_start, axis=0)  # (slots, cells)
+        self.to_pallet = {s: per_slot[i].reshape(WIDTH, HEIGHT) for i, s in enumerate(self.slots)}
+        # slot-to-slot travel: from the best access cell of a to the nearest access cell of b
+        between = np.minimum.reduceat(per_slot[:, acc], self._acc_start, axis=1).T.tolist()
+        self.between = {a: dict(zip(self.slots, row)) for a, row in zip(self.slots, between)}
+        self.to_fulfill = bfs(self.blocked, [(x, FULFILL_ROW) for x in range(WIDTH)])
+        self.to_replenish = bfs(self.blocked, [(x, REPLENISH_ROW) for x in range(WIDTH)])
+        self.to_parking = bfs(self.blocked, list(zip(*np.nonzero(self.parking))))
+        # fulfilment row -> slot travel, and slot -> replenishment row
+        self.from_top = {a: min(int(self.to_fulfill[c]) for c in self.access[a]) for a in self.slots}
+        self.to_bottom = {a: min(int(self.to_replenish[c]) for c in self.access[a]) for a in self.slots}
+
+    def dist_to_pallet(self, slot: Coords, c: Coords) -> int:
+        return int(self.to_pallet[slot][c])

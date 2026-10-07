@@ -1,11 +1,13 @@
 """Usage: python solve.py [worklist] [solution] [--window N] [--carry] [--alpha A] [--max-detour D] [--max-fill F]
                    [--future-trip K] [--min-items-per-step N] [--trip-slot above|side]
-                   [--tour greedy|sweep|best] [--rank-tour]"""
+                   [--tour greedy|sweep|best] [--rank-tour]
+                   [--reslot off|packed|linear] [--max-shift N] [--fill-weight W]"""
 
 import argparse
 import time
 
-from manager import ALPHA, FUTURE_TRIP, MAX_DETOUR, MAX_FILL, MIN_ITEMS_PER_STEP, Manager
+from manager import (ALPHA, FILL_WEIGHT, FUTURE_TRIP, MAX_DETOUR, MAX_FILL, MAX_SHIFT, MIN_ITEMS_PER_STEP,
+                     Manager)
 
 
 def main() -> None:
@@ -27,16 +29,24 @@ def main() -> None:
                     help="order tour: greedy nearest-pallet, aisle-aware S-shaped sweep, or the shorter of the two")
     ap.add_argument("--rank-tour", action="store_true",
                     help="rank candidate orders by the --tour estimate instead of the greedy one (~5x slower)")
+    ap.add_argument("--reslot", choices=("off", "packed", "linear"), default="off",
+                    help="where a replenished pallet goes back: its old slot, or a row set by SKU popularity "
+                         "(packed: rows filled in rank order; linear: ranks spread evenly over all rows)")
+    ap.add_argument("--max-shift", type=float, default=MAX_SHIFT,
+                    help="columns a re-slotted pallet may move sideways before its detour must pay for itself")
+    ap.add_argument("--fill-weight", type=float, default=FILL_WEIGHT,
+                    help="steps saved per order served, per step a new slot is nearer the fulfilment row")
     args = ap.parse_args()
 
     start = time.time()
     m = Manager(args.worklist, window=args.window, carry=args.carry, alpha=args.alpha,
                 max_detour=args.max_detour, max_fill=args.max_fill,
                 future_trip=args.future_trip, min_items_per_step=args.min_items_per_step,
-                trip_slot=args.trip_slot, tour_mode=args.tour, rank_tour=args.rank_tour)
+                trip_slot=args.trip_slot, tour_mode=args.tour, rank_tour=args.rank_tour,
+                reslot=args.reslot, max_shift=args.max_shift, fill_weight=args.fill_weight)
     makespan = m.solve()
     m.write_solution(args.solution)
-    print(f"makespan {makespan} timesteps, {m.trips} trips, {m.replenishments} replenishments, "
+    print(f"makespan {makespan} timesteps, {m.trips} trips, {m.replenishments} replenishments ({m.moved} re-slotted), "
           f"wrote {args.solution} in {time.time() - start:.1f}s")
 
 

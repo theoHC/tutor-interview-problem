@@ -14,4 +14,14 @@ Wow. Carrying is actually nontrivial to pull off, and not the help I imagined it
 
 I'd bet a more serious rethink of my planning approach (vs. the naive space time reservation table w/o replanning) would give me the biggest potential gains, but while I'm willing to let Claude do a lot of detail trobuleshooting for a project like this, I do insist on understanding my planning algorithms, and don't really have time to do the sort of deeper dive that I think I'd want to do/that would get me the best results. I really feel like there's some space here for employing optimal control concepts to do smarter global searches. If I didn't have a very hard final project for my masters degree right now, I'd definitely have spent more time trying to come up with an optimal control version of this problem. Even if it turned out to be the wrong way, I feel like it'd make me a smarter engineer. Very sad that we don't live in "infinite time for interesting problems" universe.
 
-Hey, looks like smarter sweeping (explicitly handling the aisles, and only when it's better than ordering pallets greedily) gets us some tasty tasty gains at the expenese of crazy extra runtime, but now down to like 62,398. That's like. Real. But not much. This problem is funky.
+Hey, looks like smarter sweeping (explicitly handling the aisles, and only when it's better than ordering pallets greedily) gets us some tasty tasty gains at the expenese of crazy extra runtime, but now down to like 62,398. That's like. Real. But not much.
+
+Ok actually that's not really tasty. Nice sure, but like. I should be expecting more. Gah. My planerrrrrr.
+
+Ok, let's try a floor plan improvement - allowing the columns to be marched towards the fulfilment zone whenever they're taken down for refilling. So high runners should end up very close to fulfilment and less common ones further down. If this one doesn't take a big bite out of my performance, I'll call it on this problem.
+
+Oh god, naive re-organizing of the pallets doesn't seem to help either. OK, this is an AI-encouraged problem, let's see if that helps. I can see the LLM chain-of-thought review after some incident report now "best approach depends on if reviewer cares more about final score or process integrity...". Anyhow, let's just let it go wild on planner improvements next, and if they turn out to work I'll do some reading on them.
+
+Yeah the constant thread on these is that the cost of the optimization kills the gains - turns out that the fully re-organized warehouse is like 10% better than the default layout, but the partially reorganized warehouse is actually worse. Goddamn does this suck. Local attacks on a global problem just be like this.
+
+Hmmm... potentially, starting sorting could save me about 2000 moves. Let's give it a shot.

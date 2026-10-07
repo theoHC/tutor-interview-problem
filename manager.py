@@ -23,7 +23,7 @@ from enum import Enum, auto
 from itertools import permutations
 
 from coopastar import NoPath, plan
-from navigation import FULFILL_ROW, HEIGHT, REPLENISH_ROW, ReservationTable, StaticMap, bfs
+from navigation import FULFILL_ROW, HEIGHT, REPLENISH_ROW, SLOT_ROWS, ReservationTable, StaticMap, bfs
 from objects import Action, Coords, Pallet, Robot
 
 UNMET_PENALTY = 1000  # estimated cost per item an order cannot currently get (used when ranking replenishments)
@@ -44,6 +44,10 @@ MAX_FILL = 0.5  # ignore pallets fuller than this fraction: refilling them gains
 FUTURE_TRIP = 1.0  # extra's detour must be <= this * (the dedicated trip it saves * chance that trip is ever needed)
 MIN_ITEMS_PER_STEP = 1.0  # extra must newly cover at least this many items of demand per step of detour
 END_WEIGHT = 0.5  # how much the trip's end position (distance back to the fulfilment row) counts in its length
+
+# Re-slotting a replenished pallet (see `choose_slot`)
+MAX_SHIFT = 7  # columns of horizontal shift accepted without the detour-vs-savings test (7 = one column pair)
+FILL_WEIGHT = 1.0  # steps saved per order served, per step a slot is closer to the fulfilment row
 
 
 Foot = list[tuple[int, Coords]]  # (entity id, offset from robot); robot first at (0, 0)
@@ -76,7 +80,8 @@ class Manager:
     def __init__(self, path: str, window: int = 10, carry: bool = False, alpha: float = ALPHA,
                  max_detour: float = MAX_DETOUR, max_fill: float = MAX_FILL, future_trip: float = FUTURE_TRIP,
                  min_items_per_step: float = MIN_ITEMS_PER_STEP, trip_slot: str = "above",
-                 tour_mode: str = "best", rank_tour: bool = False):
+                 tour_mode: str = "best", rank_tour: bool = False, reslot: str = "off",
+                 max_shift: float = MAX_SHIFT, fill_weight: float = FILL_WEIGHT, live_map: bool = True):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
@@ -86,17 +91,22 @@ class Manager:
         self.trip_slot = trip_slot
         self.tour_mode = tour_mode
         self.rank_tour = rank_tour
+        self.reslot, self.max_shift, self.fill_weight = reslot, max_shift, fill_weight
+        self.live_map = live_map  # recompute distance tables whenever a pallet changes slot (else: starting layout)
         self._load(path)
         self.reservations = ReservationTable(self.entities)
-        self.map = StaticMap(self.pallets)
+        self.map = StaticMap(self.pallets, reslot=reslot != "off")
         self.by_sku: dict[int, list[Pallet]] = {}
         for p in self.pallets:
             self.by_sku.setdefault(p.sku, []).append(p)
         self.demand = Counter(sku for _, skus in self.tasks for sku in skus)  # items still to be planned, per SKU
+        self.visits = Counter(sku for _, skus in self.tasks for sku in set(skus))  # orders still to plan, per SKU
+        self.target_row = self._target_rows()
         self._cell_bfs: dict[Coords, object] = {}
         self._spot_bfs: dict[tuple, object] = {}
         self.trips = 0
         self.replenishments = 0  # pallets refilled (the carried one included)
+        self.moved = 0  # refills that put the pallet in a different slot from the one it came from
 
     def _load(self, path: str) -> None:
         with open(path) as f:
@@ -145,6 +155,7 @@ class Manager:
             if task[0] is TaskType.ORDER:
                 self.tasks.remove(task)
                 self.demand.subtract(task[1])
+                self.visits.subtract(set(task[1]))
                 done += 1
                 if verbose and done % 50 == 0:
                     print(f"  {done} orders planned, frontier t={robot.frontier[-1][1]}, "
@@ -161,13 +172,31 @@ class Manager:
         top = [sku for sku, _ in self.demand.most_common(len(robots))]
         best = None
         for perm in permutations(top):
-            picks = [min(self.by_sku[s], key=lambda p: self.map.dist_to_pallet(p.id, r.pos)) for r, s in zip(robots, perm)]
-            cost = sum(self.map.dist_to_pallet(p.id, r.pos) for r, p in zip(robots, picks))
+            picks = [min(self.by_sku[s], key=lambda p: self.map.dist_to_pallet(p.pos, r.pos)) for r, s in zip(robots, perm)]
+            cost = sum(self.map.dist_to_pallet(p.pos, r.pos) for r, p in zip(robots, picks))
             if best is None or cost < best[0]:
                 best = (cost, picks)
         for r, p in zip(robots, best[1]):
             if not self.execute(r, (TaskType.CARRY, p)):
                 print(f"  robot {r.id} could not pick up pallet {p.id} (sku {p.sku}); it carries nothing")
+
+    def _target_rows(self) -> dict[int, int]:
+        """Row each SKU's pallets are aimed at when re-slotted. SKUs are ranked by how many orders use them (ties: by
+        items). packed: walk down the slot rows, giving each SKU the row its pallets would land on if the blocks were
+        filled in rank order. linear: spread the ranks evenly from the top allowable row to the bottom one."""
+        if self.reslot == "off":
+            return {}
+        ranked = sorted(self.by_sku, key=lambda s: (-self.visits[s], -self.demand[s]))
+        per_row = len(self.map.by_row[SLOT_ROWS[0]])
+        rows, seen = {}, 0
+        for i, sku in enumerate(ranked):
+            if self.reslot == "linear":
+                k = round(i * (len(SLOT_ROWS) - 1) / max(1, len(ranked) - 1))
+            else:
+                k = min(seen // per_row, len(SLOT_ROWS) - 1)
+            rows[sku] = SLOT_ROWS[k]
+            seen += len(self.by_sku[sku])
+        return rows
 
     # ------------------------------------------------------------------ task selection
 
@@ -231,14 +260,16 @@ class Manager:
                 a = override.get(p.id, p.planned_count) if override else p.planned_count
                 if a > 0:
                     avail[p.id] = a
+        E, m = self.entities, self.map
         while avail:
             best, best_cost = None, None
             for pid, a in avail.items():
+                s = E[pid].pos
                 if cur is None:
-                    d = self.map.from_top[pid] if start is None else self.map.dist_to_pallet(pid, start)
+                    d = m.from_top[s] if start is None else m.dist_to_pallet(s, start)
                 else:
-                    d = self.map.between[cur][pid]
-                d = max(d, self.entities[pid].locked_until + 1 - t)
+                    d = m.between[E[cur].pos][s]
+                d = max(d, E[pid].locked_until + 1 - t)
                 if best_cost is None or d < best_cost:
                     best, best_cost = pid, d
             p = self.entities[best]
@@ -253,7 +284,7 @@ class Manager:
                 for q in self.by_sku[p.sku]:
                     avail.pop(q.id, None)
         if cur is not None:
-            travel += self.map.from_top[cur]
+            travel += m.from_top[E[cur].pos]
         return stops, travel, sum(need.values())
 
     # ------------------------------------------------------------------ aisle-aware S-shaped sweep
@@ -303,16 +334,17 @@ class Manager:
         still out being replenished, as `route` does."""
         if not order:
             return 0
-        m, travel, cur = self.map, 0, None
+        m, E, travel, cur = self.map, self.entities, 0, None
         for pid in order:
+            s = E[pid].pos
             if cur is None:
-                d = m.from_top[pid] if start is None else m.dist_to_pallet(pid, start)
+                d = m.from_top[s] if start is None else m.dist_to_pallet(s, start)
             else:
-                d = m.between[cur][pid]
-            d = max(d, self.entities[pid].locked_until + 1 - t)
+                d = m.between[cur][s]
+            d = max(d, E[pid].locked_until + 1 - t)
             travel += d
             t += d + qty[pid]
-            cur = pid
+            cur = s
         return travel + m.from_top[cur]
 
     def _sweep(self, pids: list[int], cost) -> list[int]:
@@ -324,7 +356,7 @@ class Manager:
                  [p for p in pids if self.entities[p].pos[1] >= HEIGHT // 2])
         best, best_cost = None, None
         for first, second in (bands, bands[::-1]):
-            n = len({m.side[p][0] for p in first})
+            n = len({m.side[self.entities[p].pos][0] for p in first})
             for lr1 in (True, False):
                 for lr2 in (True, False):
                     order = self._serpentine(first, lr1, True) + self._serpentine(second, lr2, n % 2 == 0)
@@ -337,7 +369,7 @@ class Manager:
         side = self.map.side
         lanes: dict[int, list[int]] = {}
         for p in pids:
-            lanes.setdefault(side[p][0], []).append(p)
+            lanes.setdefault(side[self.entities[p].pos][0], []).append(p)
         out = []
         for i, x in enumerate(sorted(lanes, reverse=not left_to_right)):
             lane = sorted(lanes[x], key=lambda p: self.entities[p].pos[1])
@@ -380,8 +412,8 @@ class Manager:
 
     def dedicated_trip(self, p: Pallet) -> float:
         """Estimated length of a trip from the fulfilment row that refills only `p` (as `trip_cost` measures it)."""
-        m, side = self.map, self.map.side[p.id]
-        return m.from_top[p.id] + 2 * m.to_bottom[p.id] + int(m.to_parking[side]) + END_WEIGHT * int(m.to_fulfill[side])
+        m, side = self.map, self.map.side[p.pos]
+        return m.from_top[p.pos] + 2 * m.to_bottom[p.pos] + int(m.to_parking[side]) + END_WEIGHT * int(m.to_fulfill[side])
 
     def extra_ok(self, p: Pallet, gain: int, marginal: float) -> bool:
         """Caps an extra pallet must pass on top of a positive score. If the detour is free, accept it."""
@@ -400,16 +432,16 @@ class Manager:
         m = self.map
         if not seq:
             return int(m.to_replenish[start]) + END_WEIGHT * (HEIGHT - 1)
-        inner = sum(m.between[a.id][b.id] for a, b in zip(seq, seq[1:])) + m.to_bottom[seq[-1].id]
-        end = m.side[seq[0].id]
-        return m.dist_to_pallet(seq[0].id, start) + 2 * inner + int(m.to_parking[end]) + END_WEIGHT * int(m.to_fulfill[end])
+        inner = sum(m.between[a.pos][b.pos] for a, b in zip(seq, seq[1:])) + m.to_bottom[seq[-1].pos]
+        end = m.side[seq[0].pos]
+        return m.dist_to_pallet(seq[0].pos, start) + 2 * inner + int(m.to_parking[end]) + END_WEIGHT * int(m.to_fulfill[end])
 
     def replenish_task(self, robot: Robot, seed: Pallet | None) -> Task | None:
         """Build a trip around `seed` (or around just the carried pallet), adding extras while they score well."""
         seq = [seed] if seed is not None else []
         if not seq and robot.carry is None:
             return None
-        free = set(SIDES) - {self.map.side_off[p.id] for p in seq}  # the seed takes one side slot
+        free = set(SIDES) - {self.map.side_off[p.pos] for p in seq}  # the seed takes one side slot
         if robot.carry is None or self.trip_slot == "above":
             # extras only use the side slots (above needs an end-of-column pallet docked from below)
             return TaskType.REPLENISH, (tuple(self._add_extras(robot, seq, free)[0]), tuple(seq), ABOVE)
@@ -432,7 +464,7 @@ class Manager:
             best = None
             for q in self.pallets:
                 if (q in seq or q.carrier is not None or q.locked_until >= self.min_frontier or q.last_pick >= t0
-                        or self.map.side_off[q.id] not in slots or q.planned_count > self.max_fill * q.max_count):
+                        or self.map.side_off[q.pos] not in slots or q.planned_count > self.max_fill * q.max_count):
                     continue
                 gain = self.refill_gain(q, stock)
                 if gain <= 0:
@@ -448,10 +480,54 @@ class Manager:
                 break
             score, seq, q = best
             total += score
-            slots.discard(self.map.side_off[q.id])
+            slots.discard(self.map.side_off[q.pos])
             base = self.trip_cost(robot.pos, seq)
             stock[q.sku] += q.max_count - q.planned_count  # a second pallet of this SKU only scores what's still short
         return seq, total
+
+    # ------------------------------------------------------------------ re-slotting replenished pallets
+
+    def orders_served(self, p: Pallet) -> float:
+        """Orders a full `p` can serve before it runs dry, at the SKU's average quantity per remaining order."""
+        visits = self.visits[p.sku]
+        if visits <= 0:
+            return 0.0
+        return min(visits, p.max_count / max(1.0, self.demand[p.sku] / visits))
+
+    def choose_slot(self, p: Pallet, pos: Coords, t: int, taken: set[Coords]) -> Coords:
+        """Where to put `p` back after its refill, the robot standing at `pos` at timestep t.
+
+        Walk down the slot rows from the SKU's target row. On each row take the open slot (on p's side of a column
+        pair, nothing reserved in it from t on) nearest the robot. A slot within `max_shift` columns of p's
+        current slot is taken outright. A farther one must pay for its detour: fill_weight * (steps it is closer to
+        the fulfilment row) * (orders p will serve) - (extra steps to put it there and park) must be positive.
+        Otherwise try the next row down. Reaching p's own row (or running out of rows) puts it back where it was.
+        """
+        home = p.pos
+        if self.reslot == "off":
+            return home
+        m, rt = self.map, self.reservations
+        dist = self._heuristic_cell(pos)  # BFS from the robot (distances are symmetric)
+
+        def cost(s: Coords) -> float:
+            side = m.side[s]
+            return int(dist[side]) + int(m.to_parking[side]) + END_WEIGHT * int(m.to_fulfill[side])
+
+        rows = SLOT_ROWS[SLOT_ROWS.index(self.target_row[p.sku]):]
+        for y in rows:
+            if y == home[1]:
+                return home
+            open_ = [s for s in m.by_row[y] if s not in taken and m.side_off[s] == m.side_off[home]
+                     and rt.free_for(*s, t, None, ())]
+            if not open_:
+                continue
+            s = min(open_, key=lambda s: dist[m.side[s]])
+            if abs(m.side[s][0] - m.side[home][0]) <= self.max_shift:
+                return s
+            saved = self.fill_weight * (m.from_top[home] - m.from_top[s]) * self.orders_served(p)
+            if saved - (cost(s) - cost(home)) > 0:
+                return s
+        return home
 
     # ------------------------------------------------------------------ planning
 
@@ -563,13 +639,13 @@ class Manager:
     def _plan_carry(self, robot: Robot, pallet: Pallet, t0: int):
         """Fetch the pallet this robot will carry for the whole run, then park with it docked below."""
         actions, reservations, frontiers = [], [], []
-        rid, side = robot.id, self.map.side[pallet.id]
+        rid, side = robot.id, self.map.side[pallet.pos]
         rob = [(rid, (0, 0))]
         path, ta = self._walk(rob, robot.pos, t0, lambda c: c == side, lambda ta: ta + 1, self._heuristic_cell(side))
         self._moves(path, t0, actions, reservations, rob)
         actions.append((ta, Action.DOCK, pallet.pos))
         reservations.append((rid, side, ta, ta + 1))
-        foot = rob + [(pallet.id, self.map.side_off[pallet.id])]
+        foot = rob + [(pallet.id, self.map.side_off[pallet.pos])]
         foot, pos, t = self._flip(foot, side, ta + 1, BELOW, actions, reservations, final=True)
         frontiers.append(((), t))
 
@@ -594,10 +670,10 @@ class Manager:
                     actions.append((t + k, Action.PICK, add(pos, BELOW)))
                 t += qty
             else:
-                access = set(self.map.access[p.id])
+                access = set(self.map.access[p.pos])
                 # occupy the access cell from arrival until the pallet is available, then for `qty` picks
                 hold = lambda ta, p=p, qty=qty: max(ta, p.locked_until + 1) + qty
-                path, ta = self._walk(foot, pos, t, access.__contains__, hold, self.map.to_pallet[p.id])
+                path, ta = self._walk(foot, pos, t, access.__contains__, hold, self.map.to_pallet[p.pos])
                 self._moves(path, t, actions, reservations, foot)
                 pos, start = path[-1], max(ta, p.locked_until + 1)
                 self._hold(reservations, foot, pos, ta, start + qty)
@@ -635,7 +711,7 @@ class Manager:
         # 1. if the first pallet still has picks reserved far ahead, wait here (parked, safe) rather than squatting
         #    in the aisle, which both blocks other robots and makes the space-time search explode.
         if seq:
-            t = max(t0, seq[0].last_pick + 1 - self.map.dist_to_pallet(seq[0].id, pos))
+            t = max(t0, seq[0].last_pick + 1 - self.map.dist_to_pallet(seq[0].pos, pos))
             self._hold(reservations, foot, pos, t0, t)
         if robot.carry is not None:
             foot, pos, t = self._flip(foot, pos, t, carry_off, actions, reservations)
@@ -643,7 +719,7 @@ class Manager:
         # 2. collect each pallet; dock only after the last pick already reserved on it has happened
         docked = []
         for q in seq:
-            side = self.map.side[q.id]
+            side = self.map.side[q.pos]
             dock_at = lambda ta, q=q: max(ta, q.last_pick + 1)
             path, ta = self._walk(foot, pos, t, lambda c, s=side: c == s, lambda ta, d=dock_at: d(ta) + 1,
                                   self._heuristic_cell(side))
@@ -651,7 +727,7 @@ class Manager:
             td = dock_at(ta)
             self._hold(reservations, foot, side, ta, td + 1)
             actions.append((td, Action.DOCK, q.pos))
-            foot = foot + [(q.id, self.map.side_off[q.id])]
+            foot = foot + [(q.id, self.map.side_off[q.pos])]
             docked.append((q, td))
             pos, t = side, td + 1
 
@@ -661,37 +737,56 @@ class Manager:
         self._moves(path, t, actions, reservations, foot)
         pos, t = path[-1], ta
 
-        # 4. put each pallet back in its home slot, last docked first
-        returned = []
-        for q, td in reversed(docked):
-            side = self.map.side[q.id]
-            path, ta = self._walk(foot, pos, t, lambda c, s=side: c == s, lambda ta: ta + 1, self._heuristic_cell(side))
-            self._moves(path, t, actions, reservations, foot)
-            actions.append((ta, Action.UNDOCK, q.pos))
-            self._hold(reservations, foot, side, ta, ta + 1)
-            reservations.append((q.id, q.pos, ta, None))
-            foot = [f for f in foot if f[0] != q.id]
-            returned.append((q, td, ta))
-            pos, t = side, ta + 1
-        frontiers.append(((), t))
+        # 4. put each pallet in a slot (`choose_slot`: possibly not the one it came from), last docked first.
+        #    A new slot is parked in the reservation table while the rest of the trip is planned, so the robot's
+        #    later legs route round it; that is undone afterwards and redone on commit.
+        returned, tentative = [], []
+        try:
+            for q, td in reversed(docked):
+                slot = self.choose_slot(q, pos, t, {s for _, _, _, s in returned})
+                side = self.map.side[slot]
+                path, ta = self._walk(foot, pos, t, lambda c, s=side: c == s, lambda ta: ta + 1,
+                                      self._heuristic_cell(side))
+                self._moves(path, t, actions, reservations, foot)
+                actions.append((ta, Action.UNDOCK, slot))
+                self._hold(reservations, foot, side, ta, ta + 1)
+                reservations.append((q.id, slot, ta, None))
+                if slot != q.pos:
+                    self.reservations.park(*slot, ta, q.id)
+                    tentative.append((slot, ta))
+                foot = [f for f in foot if f[0] != q.id]
+                returned.append((q, td, ta, slot))
+                pos, t = side, ta + 1
+            frontiers.append(((), t))
 
-        # 5. clear the aisle: park somewhere open so this robot never blocks another robot's access cell
-        if robot.carry is not None:
-            foot, pos, t = self._flip(foot, pos, t, BELOW, actions, reservations, final=True)
-        else:
-            path, ta = self._walk(foot, pos, t, lambda c: self.map.parking[c], lambda ta: None, self.map.to_parking)
-            self._moves(path, t, actions, reservations, foot)
-            self._hold(reservations, foot, path[-1], ta, None)
-            pos, t = path[-1], ta
-        frontiers.append(((), t))
+            # 5. clear the aisle: park somewhere open so this robot never blocks another robot's access cell
+            if robot.carry is not None:
+                foot, pos, t = self._flip(foot, pos, t, BELOW, actions, reservations, final=True)
+            else:
+                path, ta = self._walk(foot, pos, t, lambda c: self.map.parking[c], lambda ta: None, self.map.to_parking)
+                self._moves(path, t, actions, reservations, foot)
+                self._hold(reservations, foot, path[-1], ta, None)
+                pos, t = path[-1], ta
+            frontiers.append(((), t))
+        finally:
+            for slot, ta in tentative:
+                self.reservations.unpark(*slot, ta)
 
         def commit():
             # each home cell is free while its pallet is out; the reservations above re-park it there on return.
             # Other robots may not pick from it until it is back (locked_until), by which time it is full again.
-            for q, td, tu in returned:
+            moved = False
+            for q, td, tu, slot in returned:
                 self.reservations.unpark(*q.pos, td + 1)
+                moved |= slot != q.pos
+                self.moved += slot != q.pos
+                q.pos = slot
                 q.planned_count = q.max_count
                 q.locked_until = tu
+            if moved and self.live_map:
+                self.map.relayout({p.pos for p in self.pallets if p.carrier is None})
+                self._cell_bfs.clear()
+                self._spot_bfs.clear()
             if robot.carry is not None:
                 self.entities[robot.carry].planned_count = self.entities[robot.carry].max_count
             self.trips += 1
