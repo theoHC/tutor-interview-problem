@@ -39,6 +39,8 @@ FLIP_SPAN = 64  # max timesteps a flip may leave the carried pallet standing alo
 ALPHA = 300  # steps of detour that refilling 100% of a SKU's remaining demand is worth
 MAX_DETOUR = 60  # never add more than this many estimated steps for one extra pallet
 MAX_FILL = 0.5  # ignore pallets fuller than this fraction: refilling them gains little and they won't block soon
+FUTURE_TRIP = 1.0  # extra's detour must be <= this * (the dedicated trip it saves * chance that trip is ever needed)
+MIN_ITEMS_PER_STEP = 1.0  # extra must newly cover at least this many items of demand per step of detour
 END_WEIGHT = 0.5  # how much the trip's end position (distance back to the fulfilment row) counts in its length
 
 
@@ -69,12 +71,14 @@ Reservation = tuple[int, Coords, int, int | None]
 
 class Manager:
     def __init__(self, path: str, window: int = 10, carry: bool = True, alpha: float = ALPHA,
-                 max_detour: float = MAX_DETOUR, max_fill: float = MAX_FILL):
+                 max_detour: float = MAX_DETOUR, max_fill: float = MAX_FILL, future_trip: float = FUTURE_TRIP,
+                 min_items_per_step: float = MIN_ITEMS_PER_STEP):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
         self.carry = carry
         self.alpha, self.max_detour, self.max_fill = alpha, max_detour, max_fill
+        self.future_trip, self.min_items_per_step = future_trip, min_items_per_step
         self._load(path)
         self.reservations = ReservationTable(self.entities)
         self.map = StaticMap(self.pallets)
@@ -274,12 +278,25 @@ class Manager:
 
     # ------------------------------------------------------------------ batching pallets onto a replenishment trip
 
-    def refill_share(self, p: Pallet, stock: Counter) -> float:
-        """Share of the SKU's remaining demand that refilling `p` newly covers (0 if stock already covers it all)."""
-        demand = self.demand[p.sku]
-        if demand <= 0:
-            return 0.0
-        return min(p.max_count - p.planned_count, max(0, demand - stock[p.sku])) / demand
+    def refill_gain(self, p: Pallet, stock: Counter) -> int:
+        """Items of the SKU's remaining demand that refilling `p` newly covers (0 if stock already covers it all)."""
+        return min(p.max_count - p.planned_count, max(0, self.demand[p.sku] - stock[p.sku]))
+
+    def dedicated_trip(self, p: Pallet) -> float:
+        """Estimated length of a trip from the fulfilment row that refills only `p` (as `trip_cost` measures it)."""
+        m, side = self.map, self.map.side[p.id]
+        return m.from_top[p.id] + 2 * m.to_bottom[p.id] + int(m.to_parking[side]) + END_WEIGHT * int(m.to_fulfill[side])
+
+    def extra_ok(self, p: Pallet, gain: int, marginal: float) -> bool:
+        """Caps an extra pallet must pass on top of a positive score. If the detour is free, accept it."""
+        if marginal <= 0:
+            return True
+        # 4. it must cost less than the dedicated trip it would save, discounted by the chance that trip is ever
+        #    needed: certain if the remaining shortfall uses the whole refill, proportionally less if not.
+        needed = gain / (p.max_count - p.planned_count)
+        # 5. measured in items, not demand share: share/detour >= k would just restate score > 0 with k = 1/ALPHA
+        return (marginal <= self.max_detour and marginal <= self.future_trip * needed * self.dedicated_trip(p)
+                and gain / marginal >= self.min_items_per_step)
 
     def trip_cost(self, start: Coords, seq: list[Pallet]) -> float:
         """Estimated steps for: dock `seq` in order, reach row 39, return them in reverse order, park. Plus a
@@ -298,9 +315,8 @@ class Manager:
             return None
         fallback = list(seq)
         # the carried pallet rides above the robot, so the two side slots are free; the seed takes one of them
+        # (with no carried pallet, the seed and extras still only use the side slots)
         slots = set(SIDES) - {self.map.side_off[p.id] for p in seq}
-        if robot.carry is None:
-            slots = set()  # keep it simple: robots without a carried pallet stick to one pallet per trip
         t0 = robot.frontier[-1][1]
         stock = self.stock()
         base = self.trip_cost(robot.pos, seq)
@@ -310,14 +326,15 @@ class Manager:
                 if (q in seq or q.carrier is not None or q.locked_until >= self.min_frontier or q.last_pick >= t0
                         or self.map.side_off[q.id] not in slots or q.planned_count > self.max_fill * q.max_count):
                     continue
-                share = self.refill_share(q, stock)
-                if share <= 0:
+                gain = self.refill_gain(q, stock)
+                if gain <= 0:
                     continue
+                share = gain / self.demand[q.sku]
                 for i in range(len(seq) + 1):
                     trial = seq[:i] + [q] + seq[i:]
                     marginal = self.trip_cost(robot.pos, trial) - base
                     score = self.alpha * share - marginal
-                    if marginal <= self.max_detour and score > 0 and (best is None or score > best[0]):
+                    if score > 0 and self.extra_ok(q, gain, marginal) and (best is None or score > best[0]):
                         best = (score, trial, q)
             if best is None:
                 break

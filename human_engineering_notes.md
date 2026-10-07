@@ -7,3 +7,5 @@ Firstly, Claude missed that replenishment is automatic. Having it remove a 1-tic
 First optimization is going to be having every robot carry 1 pallet of a different most-requested sku all the time, and to add some smarter replenishment heuristics (since I want to make sure that a carried pallet doesn't screw with replenishment time).
 
 Wow, that helped way less than expected - best tuned improvement took the solve down to 65,605. I think changing around the floor plan to get pallets closer to the top as part of refils is going to matter way more. Gonna try a few more Claude suggested improvements to carrying, then switch to thinking about floor plan changes.
+
+Adding some smarter filtering on replenishments seems to matter much more than 

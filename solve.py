@@ -1,9 +1,10 @@
-"""Usage: python solve.py [worklist] [solution] [--window N] [--no-carry] [--alpha A] [--max-detour D] [--max-fill F]"""
+"""Usage: python solve.py [worklist] [solution] [--window N] [--no-carry] [--alpha A] [--max-detour D] [--max-fill F]
+                   [--future-trip K] [--min-items-per-step N]"""
 
 import argparse
 import time
 
-from manager import ALPHA, MAX_DETOUR, MAX_FILL, Manager
+from manager import ALPHA, FUTURE_TRIP, MAX_DETOUR, MAX_FILL, MIN_ITEMS_PER_STEP, Manager
 
 
 def main() -> None:
@@ -15,11 +16,16 @@ def main() -> None:
     ap.add_argument("--alpha", type=float, default=ALPHA, help="steps of detour worth refilling 100%% of a SKU's demand")
     ap.add_argument("--max-detour", type=float, default=MAX_DETOUR, help="max estimated steps added per extra pallet")
     ap.add_argument("--max-fill", type=float, default=MAX_FILL, help="ignore extra pallets fuller than this fraction")
+    ap.add_argument("--future-trip", type=float, default=FUTURE_TRIP,
+                    help="extra's detour must be <= this * expected cost of the dedicated trip it saves (inf = off)")
+    ap.add_argument("--min-items-per-step", type=float, default=MIN_ITEMS_PER_STEP,
+                    help="extra must newly cover at least this many items per detour step (0 = off)")
     args = ap.parse_args()
 
     start = time.time()
     m = Manager(args.worklist, window=args.window, carry=not args.no_carry, alpha=args.alpha,
-                max_detour=args.max_detour, max_fill=args.max_fill)
+                max_detour=args.max_detour, max_fill=args.max_fill,
+                future_trip=args.future_trip, min_items_per_step=args.min_items_per_step)
     makespan = m.solve()
     m.write_solution(args.solution)
     print(f"makespan {makespan} timesteps, {m.trips} trips, {m.replenishments} replenishments, "

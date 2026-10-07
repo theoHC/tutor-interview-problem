@@ -1,0 +1,1 @@
+Whenever you're doing a search over multiple options, save the solution.txt with the best score, rather than whatever it happened to end at.
