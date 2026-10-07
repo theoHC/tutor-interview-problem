@@ -3,8 +3,8 @@
 Loop: take the robot whose frontier (the timestep at which its last planned task finishes) is smallest, give it a
 task, plan that task with cooperative A* against everything already reserved, commit, repeat.
 
-Before the loop every robot docks one pallet of a different top-demand SKU and carries it for the whole run. Between
-tasks it trails directly below the robot: that still lets the robot stand on the fulfilment row and at every
+Optionally (carry=True; off by default, as it measured slower) every robot first docks one pallet of a different
+top-demand SKU and carries it for the whole run. Between tasks it trails directly below the robot: that still lets the robot stand on the fulfilment row and at every
 pallet's side access cell.
 
 Task choice for that robot:
@@ -30,7 +30,9 @@ UNMET_PENALTY = 1000  # estimated cost per item an order cannot currently get (u
 IDLE_STEP = 10  # how far a robot's frontier advances when it has nothing it can do right now
 
 BELOW = (0, 1)  # carried pallet's offset during orders
-ABOVE = (0, -1)  # ...and on replenishment trips: the robot must stand on row 39, and both side slots stay free
+ABOVE = (0, -1)  # on replenishment trips it can't stay below (the robot must stand on row 39). Either it rides above,
+#                  leaving both side slots for other pallets, or (trip_slot="side") it takes a side slot: half the
+#                  walk round to flip it, but one slot fewer
 SIDES = ((1, 0), (-1, 0))
 FLIP_SPAN = 64  # max timesteps a flip may leave the carried pallet standing alone
 
@@ -61,7 +63,8 @@ class TaskType(Enum):
     CARRY = auto()
 
 
-# (ORDER, tuple of SKUs), (REPLENISH, (pallets to dock in order, fallback if that can't be planned)) or (CARRY, pallet)
+# (ORDER, tuple of SKUs), (CARRY, pallet) or
+# (REPLENISH, (pallets to dock in order, fallback if that can't be planned, carried pallet's offset on the trip))
 Task = tuple[TaskType, object]
 
 # A tentative plan is committed only once every stage of it has been found:
@@ -70,15 +73,16 @@ Reservation = tuple[int, Coords, int, int | None]
 
 
 class Manager:
-    def __init__(self, path: str, window: int = 10, carry: bool = True, alpha: float = ALPHA,
+    def __init__(self, path: str, window: int = 10, carry: bool = False, alpha: float = ALPHA,
                  max_detour: float = MAX_DETOUR, max_fill: float = MAX_FILL, future_trip: float = FUTURE_TRIP,
-                 min_items_per_step: float = MIN_ITEMS_PER_STEP):
+                 min_items_per_step: float = MIN_ITEMS_PER_STEP, trip_slot: str = "above"):
         self.entities: list[Robot | Pallet] = []  # index == id
         self.tasks: deque[Task] = deque()
         self.window = window
         self.carry = carry
         self.alpha, self.max_detour, self.max_fill = alpha, max_detour, max_fill
         self.future_trip, self.min_items_per_step = future_trip, min_items_per_step
+        self.trip_slot = trip_slot
         self._load(path)
         self.reservations = ReservationTable(self.entities)
         self.map = StaticMap(self.pallets)
@@ -313,10 +317,22 @@ class Manager:
         seq = [seed] if seed is not None else []
         if not seq and robot.carry is None:
             return None
-        fallback = list(seq)
-        # the carried pallet rides above the robot, so the two side slots are free; the seed takes one of them
-        # (with no carried pallet, the seed and extras still only use the side slots)
-        slots = set(SIDES) - {self.map.side_off[p.id] for p in seq}
+        free = set(SIDES) - {self.map.side_off[p.id] for p in seq}  # the seed takes one side slot
+        if robot.carry is None or self.trip_slot == "above":
+            # extras only use the side slots (above needs an end-of-column pallet docked from below)
+            return TaskType.REPLENISH, (tuple(self._add_extras(robot, seq, free)[0]), tuple(seq), ABOVE)
+        # the carried pallet takes a side slot too: whichever leaves the better extra
+        options = []
+        for off in sorted(free):
+            extended, score = self._add_extras(robot, seq, free - {off})
+            options.append((score, extended, off))
+        score, extended, off = max(options, key=lambda o: o[0])
+        return TaskType.REPLENISH, (tuple(extended), tuple(seq), off)
+
+    def _add_extras(self, robot: Robot, seq: list[Pallet], slots: set[Coords]) -> tuple[list[Pallet], float]:
+        """Greedily insert extra pallets into the free `slots` while they score well and pass the caps.
+        Returns the new docking order and the total score of what was added."""
+        slots, total = set(slots), 0.0
         t0 = robot.frontier[-1][1]
         stock = self.stock()
         base = self.trip_cost(robot.pos, seq)
@@ -338,11 +354,12 @@ class Manager:
                         best = (score, trial, q)
             if best is None:
                 break
-            _, seq, q = best
+            score, seq, q = best
+            total += score
             slots.discard(self.map.side_off[q.id])
             base = self.trip_cost(robot.pos, seq)
             stock[q.sku] += q.max_count - q.planned_count  # a second pallet of this SKU only scores what's still short
-        return TaskType.REPLENISH, (tuple(seq), tuple(fallback))
+        return seq, total
 
     # ------------------------------------------------------------------ planning
 
@@ -358,9 +375,9 @@ class Manager:
         elif task[0] is TaskType.CARRY:
             attempts = [lambda: self._plan_carry(robot, task[1], t0)]
         else:
-            seq, fallback = task[1]
+            seq, fallback, carry_off = task[1]
             seqs = [seq] if seq == fallback else [seq, fallback]
-            attempts = [lambda s=s: self._plan_replenish(robot, list(s), t0) for s in seqs]
+            attempts = [lambda s=s: self._plan_replenish(robot, list(s), t0, carry_off) for s in seqs]
         for attempt in attempts:
             try:
                 result = attempt()
@@ -513,8 +530,8 @@ class Manager:
 
         return reservations, actions, frontiers, path[-1], commit
 
-    def _plan_replenish(self, robot: Robot, seq: list[Pallet], t0: int):
-        """Trip to the replenishment row: flip the carried pallet above the robot, dock `seq` in order (each from
+    def _plan_replenish(self, robot: Robot, seq: list[Pallet], t0: int, carry_off: Coords = ABOVE):
+        """Trip to the replenishment row: flip the carried pallet to `carry_off` (above or to one side), dock `seq` in order (each from
         its side access cell, into the slot that leaves it at its home offset), refill, then undock them in reverse
         order. Reversing makes every undock footprint identical to the matching dock footprint, which was valid.
         Finally flip the carried pallet back below and park."""
@@ -529,7 +546,7 @@ class Manager:
             t = max(t0, seq[0].last_pick + 1 - self.map.dist_to_pallet(seq[0].id, pos))
             self._hold(reservations, foot, pos, t0, t)
         if robot.carry is not None:
-            foot, pos, t = self._flip(foot, pos, t, ABOVE, actions, reservations)
+            foot, pos, t = self._flip(foot, pos, t, carry_off, actions, reservations)
 
         # 2. collect each pallet; dock only after the last pick already reserved on it has happened
         docked = []

@@ -8,4 +8,6 @@ First optimization is going to be having every robot carry 1 pallet of a differe
 
 Wow, that helped way less than expected - best tuned improvement took the solve down to 65,605. I think changing around the floor plan to get pallets closer to the top as part of refils is going to matter way more. Gonna try a few more Claude suggested improvements to carrying, then switch to thinking about floor plan changes.
 
-Adding some smarter filtering on replenishments seems to matter much more than 
+Adding some smarter filtering on replenishments seems to matter much more than carrying, and in fact at least in my current setup carrying seems to make things worse due to how it affects my replenishment runs. Getting the sense that carrying matters much less than I expected, and that floor plan is really where the gains are for me at my current level of available time for this problem.
+
+Wow. Carrying is actually nontrivial to pull off, and not the help I imagined it'd be. Smarter replenishment got me to 63k. Let's rethink this.
